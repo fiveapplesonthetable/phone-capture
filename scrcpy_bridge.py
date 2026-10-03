@@ -246,6 +246,7 @@ class ScrcpyBridge:
         self.config_packets: list[bytes] = []
         self.last_video_packet_at = time.monotonic()
         self.last_video_refresh_at = 0.0
+        self.followup_refresh_available_until = 0.0
         self.control_lock = threading.Lock()
         self.stop = threading.Event()
 
@@ -424,13 +425,22 @@ class ScrcpyBridge:
                 if not self.allow_video_refresh:
                     raise ValueError("video refresh is disabled")
                 now = time.monotonic()
-                # Viewer joins need one fresh IDR only when the source has been idle.
-                # A bounded rate prevents repeated page loads from restarting capture.
-                if ("live" in self.sinks and now - self.last_video_packet_at >= 2
-                        and now - self.last_video_refresh_at >= 20):
+                phase = payload.get("phase", "before_offer")
+                if phase not in ("before_offer", "connected"):
+                    raise ValueError("unsupported video refresh phase")
+                # The cold-start IDR can precede ICE connection. Permit exactly
+                # one follow-up once the viewer is connected, without opening a
+                # general fast reset path for repeated page loads.
+                followup = (phase == "connected" and
+                            now <= self.followup_refresh_available_until and
+                            now - self.last_video_refresh_at >= .5)
+                initial = (now - self.last_video_packet_at >= 2 and
+                           now - self.last_video_refresh_at >= 20)
+                if "live" in self.sinks and (followup or initial):
                     self.control.sendall(bytes([17]))  # TYPE_RESET_VIDEO
                     self.last_video_refresh_at = now
-                    LOG.info("Requested one idle video refresh for %s", self.device_id)
+                    self.followup_refresh_available_until = (0.0 if followup else now + 20)
+                    LOG.info("Requested %s video refresh for %s", phase, self.device_id)
                     return True
                 return False
             elif kind == "key":

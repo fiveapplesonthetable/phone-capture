@@ -37,10 +37,17 @@ class ScrcpyProtocolTests(unittest.TestCase):
             self.assertTrue(bridge._control_request({"type":"refresh_video"}))
             self.assertFalse(bridge._control_request({"type":"refresh_video"}))
             self.assertEqual(bridge.control.sent, [bytes([17])])
+            # A viewer can connect after the cold-start IDR has passed.
+            bridge.last_video_refresh_at = time.monotonic() - 1
+            self.assertTrue(bridge._control_request({"type":"refresh_video", "phase":"connected"}))
+            self.assertFalse(bridge._control_request({"type":"refresh_video", "phase":"connected"}))
+            self.assertEqual(bridge.control.sent, [bytes([17]), bytes([17])])
             bridge.last_video_refresh_at = time.monotonic() - 21
             bridge.last_video_packet_at = time.monotonic()
             self.assertFalse(bridge._control_request({"type":"refresh_video"}))
-            self.assertEqual(len(bridge.control.sent), 1)
+            self.assertEqual(len(bridge.control.sent), 2)
+            with self.assertRaises(ValueError):
+                bridge._control_request({"type":"refresh_video", "phase":"unlimited"})
 
     def test_cuttlefish_bridge_id_is_accepted(self):
         with tempfile.TemporaryDirectory() as temp:
