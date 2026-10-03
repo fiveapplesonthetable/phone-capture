@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ADB screen capture for Pixel 4 / 4 XL, with local retention and viewer upload.
+"""ADB screen capture for Pixel 4 / 4 XL and Cuttlefish, with viewer upload.
 
 scrcpy runs continuously without a playback window. FFmpeg closes short MP4
 segments, which are uploaded to the viewer and mirrored onto the phone.
@@ -31,6 +31,9 @@ PHONE_ROOT = "/sdcard/Movies/PhoneCapture"
 VALID_SERIAL = re.compile(r"^[A-Za-z0-9._:-]+$")
 VALID_SESSION = re.compile(r"^[A-Za-z0-9_-]+$")
 VALID_FILE = re.compile(r"^(?:\d{10}|\d{8}T\d{6}Z-(?:\d{10}|[0-9a-f]{6}))\.mp4$")
+DEVICE_MODELS = {"pixel 4": "pixel-4", "pixel 4 xl": "pixel-4-xl",
+                 "cuttlefish x86_64 phone": "cuttlefish"}
+DEVICE_IDS = tuple(DEVICE_MODELS.values())
 
 
 def is_archive_path(path: str) -> bool:
@@ -118,7 +121,8 @@ def scrcpy_live_ffmpeg_command(ffmpeg: str, socket: str, rtsp_url: str) -> list[
 def scrcpy_bridge_command(script: str, device_id: str, serial: str,
                           adb_socket: str | None,
                           server_jar: str | None = None,
-                          bit_rate: str = "4M", max_size: int = 720) -> list[str]:
+                          bit_rate: str = "4M", max_size: int = 720,
+                          allow_video_refresh: bool = False) -> list[str]:
     command = [sys.executable, script, "--device-id", device_id, "--serial", serial]
     if adb_socket:
         command += ["--adb-server-socket", adb_socket,
@@ -129,6 +133,8 @@ def scrcpy_bridge_command(script: str, device_id: str, serial: str,
     suffix = bit_rate[-1].upper()
     rate = int(bit_rate[:-1]) * multiplier[suffix] if suffix in multiplier else int(bit_rate)
     command += ["--bit-rate", str(rate), "--max-size", str(max_size)]
+    if allow_video_refresh:
+        command.append("--allow-video-refresh")
     return command
 
 
@@ -195,7 +201,7 @@ class PhoneWorker:
         if model.returncode:
             return False
         name = model.stdout.strip().lower()
-        self.device_id = {"pixel 4": "pixel-4", "pixel 4 xl": "pixel-4-xl"}.get(name)
+        self.device_id = DEVICE_MODELS.get(name)
         if self.device_id is None:
             LOG.info("Ignoring %s: unsupported model %r", self.serial, name)
             return False
@@ -376,7 +382,8 @@ class PhoneWorker:
         bridge_command = scrcpy_bridge_command(
             self.config.scrcpy_bridge_script, self.device_id, self.serial, self.socket,
             str(Path(self.config.scrcpy).parent / "scrcpy-server"),
-            self.config.bit_rate, self.config.max_size)
+            self.config.bit_rate, self.config.max_size,
+            self.device_id in self.config.scrcpy_refresh_device)
         rtsp_url = (self.config.scrcpy_rtsp_base.rstrip("/") + "/" + self.device_id
                     if self.config.scrcpy_rtsp_base else None)
         fanout = self.config.scrcpy_live_fanout and rtsp_url is not None
@@ -734,10 +741,10 @@ def main() -> None:
     parser.add_argument("--max-host-gib", type=float, default=2)
     parser.add_argument("--session-seconds", type=int, default=3600)
     parser.add_argument("--scrcpy-remote-device", action="append", default=[],
-                        choices=("pixel-4", "pixel-4-xl"),
+                        choices=DEVICE_IDS,
                         help="opt in a device to scrcpy through its ADB server")
     parser.add_argument("--scrcpy-bridge-device", action="append", default=[],
-                        choices=("pixel-4", "pixel-4-xl"),
+                        choices=DEVICE_IDS,
                         help="opt in a device to one scrcpy video/control bridge")
     parser.add_argument("--scrcpy-bridge-script",
                         default=str(Path(__file__).resolve().parent / "scrcpy_bridge.py"))
@@ -745,6 +752,9 @@ def main() -> None:
                         help="optional localhost RTSP base; each device publishes to /<device-id>")
     parser.add_argument("--scrcpy-live-fanout", action="store_true",
                         help="publish bridge H.264 over separate live socket and FFmpeg process")
+    parser.add_argument("--scrcpy-refresh-device", action="append", default=[],
+                        choices=DEVICE_IDS,
+                        help="allow rate-limited, on-demand idle video refresh for this device")
     parser.add_argument("--scrcpy-max-start-c", type=float, default=45.0,
                         help="start opt-in scrcpy only below this battery temperature")
     parser.add_argument("--verbose", action="store_true")
@@ -762,6 +772,8 @@ def main() -> None:
             parser.error(str(exc))
     if config.scrcpy_live_fanout and (not config.scrcpy_bridge_device or not config.scrcpy_rtsp_base):
         parser.error("scrcpy-live-fanout requires a bridge device and RTSP base")
+    if any(device not in config.scrcpy_bridge_device for device in config.scrcpy_refresh_device):
+        parser.error("scrcpy-refresh-device requires that device in scrcpy-bridge-device")
     if not 1 <= config.segment_seconds <= 180:
         parser.error("segment-seconds must be between 1 and 180")
     logging.basicConfig(level=logging.DEBUG if config.verbose else logging.INFO,
