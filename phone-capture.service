@@ -1,0 +1,17 @@
+[Unit]
+Description=Continuous Pixel screen capture for recordings viewer
+After=network-online.target recordings-viewer.service
+Wants=network-online.target
+Requires=recordings-viewer.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/phone-capture
+EnvironmentFile=%h/.config/phone-capture/env
+ExecStart=/usr/bin/python3 %h/phone-capture/phone_capture.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=45
+
+[Install]
+WantedBy=default.target
