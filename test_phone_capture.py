@@ -9,12 +9,45 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from phone_capture import (PhoneWorker, is_archive_path, scrcpy_bridge_command,
-                           scrcpy_ffmpeg_command, scrcpy_live_ffmpeg_command,
+                           scrcpy_direct_rtsp_command, scrcpy_ffmpeg_command,
+                           scrcpy_live_ffmpeg_command, rtsp_path_available,
                            scrcpy_start_allowed, scrcpy_tunnel_host, stop_workers,
                            thermal_state, validate_local_rtsp)
 
 
 class ArchiveTests(unittest.TestCase):
+    def test_direct_side_commands_preserve_legacy_publisher(self):
+        bridge = scrcpy_bridge_command("/tmp/bridge.py", "pixel-4-xl", "TEST", None,
+                                       raw_live_socket=True)
+        self.assertIn("--raw-live-socket", bridge)
+        legacy = scrcpy_live_ffmpeg_command("ffmpeg", "/tmp/live.sock",
+                                             "rtsp://127.0.0.1:18554/pixel-4-xl")
+        direct = scrcpy_direct_rtsp_command("/tmp/direct.py", "/tmp/raw.sock",
+                                           "rtsp://127.0.0.1:18555/pixel-4-xl-direct")
+        self.assertIn("18554/pixel-4-xl", legacy[-1])
+        self.assertEqual(direct[-1], "rtsp://127.0.0.1:18555/pixel-4-xl-direct")
+
+    def test_direct_gateway_path_probe_detects_eviction_and_outage(self):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(2)
+        port = listener.getsockname()[1]
+        def serve():
+            with listener:
+                for status in (b"200 OK", b"404 Not Found"):
+                    conn, _ = listener.accept()
+                    with conn:
+                        request = conn.recv(1024)
+                        self.assertIn(b"DESCRIBE rtsp://127.0.0.1", request)
+                        conn.sendall(b"RTSP/1.0 " + status + b"\r\nCSeq: 1\r\n\r\n")
+        server = threading.Thread(target=serve)
+        server.start()
+        url = f"rtsp://127.0.0.1:{port}/phone-direct"
+        self.assertTrue(rtsp_path_available(url))
+        self.assertFalse(rtsp_path_available(url))
+        server.join(timeout=2)
+        self.assertFalse(rtsp_path_available(url))
+
     def test_cuttlefish_uses_stable_viewer_id_on_local_adb(self):
         worker = object.__new__(PhoneWorker)
         worker.serial = "0.0.0.0:6520"

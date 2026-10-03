@@ -124,6 +124,63 @@ class VideoSink:
             self.close()
 
 
+class RawVideoSink:
+    """Bounded Annex-B H.264 side stream; the archive sink remains independent."""
+
+    def __init__(self, reader: socket.socket, width: int, height: int):
+        self.reader = reader
+        self.width, self.height = width, height
+        self.closed = False
+        self.pending_bytes = 0
+        self.lock = threading.Lock()
+        self.items: queue.Queue[tuple[bytes, int, bool] | None] = queue.Queue(30)
+        self.thread = threading.Thread(target=self._write_loop, daemon=True)
+        self.thread.start()
+
+    def offer(self, payload: bytes, pts: int, keyframe: bool, config: bytes) -> bool:
+        frame = config + payload if keyframe else payload
+        with self.lock:
+            if self.closed:
+                return False
+            if self.items.full() or self.pending_bytes + len(frame) > 8 * 1024 * 1024:
+                LOG.warning("raw live consumer fell behind; disconnecting")
+                self.close()
+                return False
+            self.items.put_nowait((frame, pts, keyframe))
+            self.pending_bytes += len(frame)
+        return True
+
+    def close(self) -> None:
+        self.closed = True
+        try:
+            self.reader.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self.reader.close()
+
+    def _write_loop(self) -> None:
+        try:
+            sent_header = False
+            while not self.closed:
+                try:
+                    item = self.items.get(timeout=.25)
+                except queue.Empty:
+                    continue
+                frame, pts, keyframe = item
+                with self.lock:
+                    self.pending_bytes -= len(frame)
+                if not sent_header:
+                    if not self.width or not self.height:
+                        continue
+                    self.reader.sendall(b"SCV1" + struct.pack(">HH", self.width, self.height))
+                    sent_header = True
+                self.reader.sendall(struct.pack(">BQI", int(keyframe), pts, len(frame)) + frame)
+        except OSError as exc:
+            LOG.info("raw live consumer closed: %s", exc)
+        finally:
+            self.close()
+
+
 class AdbPipe:
     """Socket-like wrapper around one binary, no-PTY ADB shell channel."""
 
@@ -202,7 +259,8 @@ class ScrcpyBridge:
     def __init__(self, *, device_id: str, serial: str, adb_server_socket: str | None,
                  tunnel_host: str, server_jar: Path, relay_jar: Path, runtime_dir: Path,
                  bit_rate: int = 4_000_000, max_size: int = 720, max_fps: int = 30,
-                 i_frame_interval: int = 1, allow_video_refresh: bool = False):
+                 i_frame_interval: int = 1, allow_video_refresh: bool = False,
+                 raw_live_socket: bool = False):
         if device_id not in ("pixel-4", "pixel-4-xl", "cuttlefish"):
             raise ValueError("unknown device id")
         if not serial or any(c.isspace() for c in serial):
@@ -220,6 +278,7 @@ class ScrcpyBridge:
             raise ValueError("I-frame interval must be 1–10 seconds")
         self.i_frame_interval = i_frame_interval
         self.allow_video_refresh = allow_video_refresh
+        self.raw_live_socket = raw_live_socket
         self.env = dict(os.environ)
         if adb_server_socket:
             self.env["ADB_SERVER_SOCKET"] = adb_server_socket
@@ -229,6 +288,7 @@ class ScrcpyBridge:
         self.remote_jar = f"/data/local/tmp/phone-capture-scrcpy-{self.scid:08x}.jar"
         self.video_socket_path = runtime_dir / f"{device_id}.video.sock"
         self.live_socket_path = runtime_dir / f"{device_id}.live.sock"
+        self.raw_live_socket_path = runtime_dir / f"{device_id}.raw.sock"
         self.control_socket_path = runtime_dir / f"{device_id}.control.sock"
         self.server_process: subprocess.Popen | None = None
         self.lock_file = None
@@ -239,8 +299,9 @@ class ScrcpyBridge:
         self.control: socket.socket | AdbPipe | None = None
         self.video_listener: socket.socket | None = None
         self.live_listener: socket.socket | None = None
+        self.raw_live_listener: socket.socket | None = None
         self.control_listener: socket.socket | None = None
-        self.sinks: dict[str, VideoSink] = {}
+        self.sinks: dict[str, VideoSink | RawVideoSink] = {}
         self.width = 0
         self.height = 0
         self.config_packets: list[bytes] = []
@@ -348,9 +409,12 @@ class ScrcpyBridge:
         previous = self.sinks.pop(name, None)
         if previous:
             previous.close()
-        self.sinks[name] = VideoSink(name, reader, self.width, self.height,
-                                     self.max_fps, 300 if name == "archive" else 30,
-                                     64 * 1024 * 1024 if name == "archive" else 8 * 1024 * 1024)
+        if name == "raw_live":
+            self.sinks[name] = RawVideoSink(reader, self.width, self.height)
+        else:
+            self.sinks[name] = VideoSink(name, reader, self.width, self.height,
+                                         self.max_fps, 300 if name == "archive" else 30,
+                                         64 * 1024 * 1024 if name == "archive" else 8 * 1024 * 1024)
         # A static screen may never emit another IDR; request a fresh encoder
         # session so each new reader receives SPS/PPS and a decodable frame.
         if self.control:
@@ -363,8 +427,10 @@ class ScrcpyBridge:
         self.video_listener.settimeout(0)
         self.live_listener.settimeout(0)
         while not self.stop.is_set():
-            ready, _, _ = select.select([self.video, self.video_listener,
-                                         self.live_listener], [], [], .25)
+            listeners = [self.video_listener, self.live_listener]
+            if self.raw_live_listener:
+                listeners.append(self.raw_live_listener)
+            ready, _, _ = select.select([self.video, *listeners], [], [], .25)
             if self.video_listener in ready:
                 try:
                     self._accept_reader("archive", self.video_listener)
@@ -373,6 +439,11 @@ class ScrcpyBridge:
             if self.live_listener in ready:
                 try:
                     self._accept_reader("live", self.live_listener)
+                except BlockingIOError:
+                    pass
+            if self.raw_live_listener and self.raw_live_listener in ready:
+                try:
+                    self._accept_reader("raw_live", self.raw_live_listener)
                 except BlockingIOError:
                     pass
             if self.video not in ready:
@@ -436,7 +507,7 @@ class ScrcpyBridge:
                             now - self.last_video_refresh_at >= .5)
                 initial = (now - self.last_video_packet_at >= 2 and
                            now - self.last_video_refresh_at >= 20)
-                if "live" in self.sinks and (followup or initial):
+                if ("live" in self.sinks or "raw_live" in self.sinks) and (followup or initial):
                     self.control.sendall(bytes([17]))  # TYPE_RESET_VIDEO
                     self.last_video_refresh_at = now
                     self.followup_refresh_available_until = (0.0 if followup else now + 20)
@@ -526,9 +597,14 @@ class ScrcpyBridge:
             self._connect_device()
             self.video_listener = self._listen(self.video_socket_path)
             self.live_listener = self._listen(self.live_socket_path)
+            if self.raw_live_socket:
+                self.raw_live_listener = self._listen(self.raw_live_socket_path)
             self.control_listener = self._listen(self.control_socket_path)
             threading.Thread(target=self._control_loop, daemon=True).start()
-            print(f"READY {self.video_socket_path} {self.live_socket_path} {self.control_socket_path}", flush=True)
+            paths = [self.video_socket_path, self.live_socket_path, self.control_socket_path]
+            if self.raw_live_socket:
+                paths.append(self.raw_live_socket_path)
+            print("READY " + " ".join(map(str, paths)), flush=True)
             try:
                 self._video_loop()
             except EOFError:
@@ -547,11 +623,11 @@ class ScrcpyBridge:
             sink.close()
         self.sinks.clear()
         for s in (self.video, self.control, self.video_listener,
-                  self.live_listener, self.control_listener):
+                  self.live_listener, self.raw_live_listener, self.control_listener):
             if s:
                 s.close()
         for path in (self.video_socket_path, self.live_socket_path,
-                     self.control_socket_path):
+                     self.raw_live_socket_path, self.control_socket_path):
             path.unlink(missing_ok=True)
         if self.server_process:
             self.server_process.terminate()
@@ -586,6 +662,8 @@ def main() -> None:
                         help="scrcpy encoder keyframe interval in seconds (1–10)")
     parser.add_argument("--allow-video-refresh", action="store_true",
                         help="allow rate-limited keyframe request for an idle new viewer")
+    parser.add_argument("--raw-live-socket", action="store_true",
+                        help="offer a bounded raw H.264 side socket for direct RTSP publishing")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     bridge = ScrcpyBridge(device_id=args.device_id, serial=args.serial,
@@ -595,7 +673,8 @@ def main() -> None:
                           runtime_dir=args.runtime_dir, bit_rate=args.bit_rate,
                           max_size=args.max_size, max_fps=args.max_fps,
                           i_frame_interval=args.i_frame_interval,
-                          allow_video_refresh=args.allow_video_refresh)
+                          allow_video_refresh=args.allow_video_refresh,
+                          raw_live_socket=args.raw_live_socket)
     def shutdown(_signal, _frame):
         bridge.stop.set()
     signal.signal(signal.SIGTERM, shutdown)

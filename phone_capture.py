@@ -15,6 +15,7 @@ import re
 import select
 import shutil
 import signal
+import socket
 import sys
 import subprocess
 import threading
@@ -90,6 +91,21 @@ def validate_local_rtsp(url: str) -> str:
     return url
 
 
+def rtsp_path_available(url: str) -> bool:
+    """Check a local publisher path; catches silent loss after gateway restart."""
+    parsed = urllib.parse.urlparse(validate_local_rtsp(url))
+    request = (f"DESCRIBE {url} RTSP/1.0\r\nCSeq: 1\r\n"
+               "Accept: application/sdp\r\n\r\n").encode("ascii")
+    try:
+        with socket.create_connection((parsed.hostname, parsed.port), timeout=1) as conn:
+            conn.settimeout(1)
+            conn.sendall(request)
+            status = conn.recv(128).split(b"\r\n", 1)[0]
+            return status.startswith(b"RTSP/1.0 200 ")
+    except OSError:
+        return False
+
+
 def scrcpy_ffmpeg_command(ffmpeg: str, fifo: str, output: str,
                           segment_seconds: int, start_number: int,
                           rtsp_url: str | None = None,
@@ -118,11 +134,18 @@ def scrcpy_live_ffmpeg_command(ffmpeg: str, socket: str, rtsp_url: str) -> list[
             "-rtsp_transport", "tcp", validate_local_rtsp(rtsp_url)]
 
 
+def scrcpy_direct_rtsp_command(script: str, socket: str, rtsp_url: str) -> list[str]:
+    """Optional side publisher; archive and existing RTSP path remain independent."""
+    return [sys.executable, script, "--socket", socket,
+            "--rtsp-url", validate_local_rtsp(rtsp_url)]
+
+
 def scrcpy_bridge_command(script: str, device_id: str, serial: str,
                           adb_socket: str | None,
                           server_jar: str | None = None,
                           bit_rate: str = "4M", max_size: int = 720,
-                          allow_video_refresh: bool = False) -> list[str]:
+                          allow_video_refresh: bool = False,
+                          raw_live_socket: bool = False) -> list[str]:
     command = [sys.executable, script, "--device-id", device_id, "--serial", serial]
     if adb_socket:
         command += ["--adb-server-socket", adb_socket,
@@ -135,6 +158,8 @@ def scrcpy_bridge_command(script: str, device_id: str, serial: str,
     command += ["--bit-rate", str(rate), "--max-size", str(max_size)]
     if allow_video_refresh:
         command.append("--allow-video-refresh")
+    if raw_live_socket:
+        command.append("--raw-live-socket")
     return command
 
 
@@ -176,6 +201,7 @@ class PhoneWorker:
         self.capture_process: subprocess.Popen | None = None
         self.mux_process: subprocess.Popen | None = None
         self.live_process: subprocess.Popen | None = None
+        self.direct_process: subprocess.Popen | None = None
         self.retry_after: dict[str, float] = {}
         self.session_started = 0.0
         self.paused_hot = False
@@ -378,12 +404,14 @@ class PhoneWorker:
         runtime_dir = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
         video_socket = runtime_dir / "phone-capture" / f"{self.device_id}.video.sock"
         live_socket = runtime_dir / "phone-capture" / f"{self.device_id}.live.sock"
+        raw_socket = runtime_dir / "phone-capture" / f"{self.device_id}.raw.sock"
         control_socket = runtime_dir / "phone-capture" / f"{self.device_id}.control.sock"
         bridge_command = scrcpy_bridge_command(
             self.config.scrcpy_bridge_script, self.device_id, self.serial, self.socket,
             str(Path(self.config.scrcpy).parent / "scrcpy-server"),
             self.config.bit_rate, self.config.max_size,
-            self.device_id in self.config.scrcpy_refresh_device)
+            self.device_id in self.config.scrcpy_refresh_device,
+            self.device_id in self.config.scrcpy_direct_device)
         rtsp_url = (self.config.scrcpy_rtsp_base.rstrip("/") + "/" + self.device_id
                     if self.config.scrcpy_rtsp_base else None)
         fanout = self.config.scrcpy_live_fanout and rtsp_url is not None
@@ -393,11 +421,18 @@ class PhoneWorker:
             int(time.time()), None if fanout else rtsp_url, mpegts_input=True)
         live_command = (scrcpy_live_ffmpeg_command(self.config.ffmpeg, str(live_socket), rtsp_url)
                         if fanout and rtsp_url else None)
+        direct_command = None
+        if fanout and self.device_id in self.config.scrcpy_direct_device:
+            direct_base = self.config.scrcpy_direct_rtsp_base or self.config.scrcpy_rtsp_base
+            direct_url = direct_base.rstrip("/") + "/" + self.device_id + "-direct"
+            direct_command = scrcpy_direct_rtsp_command(
+                self.config.scrcpy_direct_script, str(raw_socket), direct_url)
         cycle_started = time.monotonic()
         try:
             with (local_dir / "scrcpy-bridge.log").open("ab") as bridge_log, \
                     (local_dir / "ffmpeg.log").open("ab") as ffmpeg_log, \
-                    (local_dir / "ffmpeg-live.log").open("ab") as live_log:
+                    (local_dir / "ffmpeg-live.log").open("ab") as live_log, \
+                    (local_dir / "direct-live.log").open("ab") as direct_log:
                 self.capture_process = subprocess.Popen(
                     bridge_command, stdout=subprocess.PIPE, stderr=bridge_log)
                 deadline = time.monotonic() + 45
@@ -410,18 +445,27 @@ class PhoneWorker:
                         bridge_log.write(line)
                         bridge_log.flush()
                         if (line.startswith(b"READY ") and video_socket.exists()
-                                and control_socket.exists() and (not fanout or live_socket.exists())):
+                                and control_socket.exists() and (not fanout or live_socket.exists())
+                                and (not direct_command or raw_socket.exists())):
                             break
                 else:
                     raise OSError("scrcpy bridge did not become ready within 45 seconds")
                 if live_command:
                     self.live_process = subprocess.Popen(
                         live_command, stdout=live_log, stderr=live_log)
+                if direct_command:
+                    self.direct_process = subprocess.Popen(
+                        direct_command, stdout=direct_log, stderr=direct_log)
                 self.mux_process = subprocess.Popen(
                     ffmpeg_command, stdout=ffmpeg_log, stderr=ffmpeg_log)
                 LOG.info("Capturing %s via scrcpy bridge", self.device_id)
                 last_thermal_check = time.monotonic()
                 live_restart_at = 0.0
+                direct_restart_at = 0.0
+                direct_started_at = time.monotonic()
+                direct_probe_at = 0.0
+                direct_failures = 0
+                direct_missing = 0
                 while not self.stop.wait(1):
                     self.upload_wakeup.set()
                     if live_command and self.live_process and self.live_process.poll() is not None:
@@ -435,6 +479,32 @@ class PhoneWorker:
                         except OSError as exc:
                             LOG.warning("Cannot restart live publisher on %s: %s", self.device_id, exc)
                             live_restart_at = time.monotonic() + 5
+                    if direct_command and self.direct_process and self.direct_process.poll() is not None:
+                        LOG.warning("Direct RTSP side publisher stopped on %s; archive continues", self.device_id)
+                        direct_failures = (direct_failures + 1 if
+                                           time.monotonic() - direct_started_at < 15 else 0)
+                        self.direct_process = None
+                        direct_restart_at = time.monotonic() + min(30, 3 * (2 ** min(direct_failures, 4)))
+                    if (direct_command and self.direct_process and
+                            time.monotonic() - direct_started_at >= 15 and
+                            time.monotonic() - direct_probe_at >= 10):
+                        direct_probe_at = time.monotonic()
+                        direct_missing = (0 if rtsp_path_available(direct_url)
+                                          else direct_missing + 1)
+                        if direct_missing >= 2:
+                            LOG.warning("Direct RTSP path vanished on %s; reconnecting publisher", self.device_id)
+                            self.direct_process.terminate()
+                            direct_missing = 0
+                    if direct_command and self.direct_process is None and time.monotonic() >= direct_restart_at:
+                        try:
+                            self.direct_process = subprocess.Popen(
+                                direct_command, stdout=direct_log, stderr=direct_log)
+                            direct_started_at = time.monotonic()
+                            direct_probe_at = direct_started_at
+                            direct_missing = 0
+                        except OSError as exc:
+                            LOG.warning("Cannot restart direct side publisher on %s: %s", self.device_id, exc)
+                            direct_restart_at = time.monotonic() + 5
                     if time.monotonic() - last_thermal_check >= 5:
                         last_thermal_check = time.monotonic()
                         if self.check_thermal():
@@ -457,7 +527,8 @@ class PhoneWorker:
         finally:
             if self.capture_process and self.capture_process.poll() is None:
                 self.capture_process.terminate()
-            for process in (self.live_process, self.capture_process, self.mux_process):
+            for process in (self.direct_process, self.live_process,
+                            self.capture_process, self.mux_process):
                 if process:
                     try:
                         process.wait(timeout=8)
@@ -466,7 +537,7 @@ class PhoneWorker:
                         process.wait(timeout=5)
             if self.capture_process and self.capture_process.stdout:
                 self.capture_process.stdout.close()
-            self.capture_process = self.mux_process = self.live_process = None
+            self.capture_process = self.mux_process = self.live_process = self.direct_process = None
             self.upload_wakeup.set()
             if not self.stop.is_set() and not self.paused_hot:
                 if time.monotonic() - cycle_started < 10:
@@ -752,6 +823,13 @@ def main() -> None:
                         help="optional localhost RTSP base; each device publishes to /<device-id>")
     parser.add_argument("--scrcpy-live-fanout", action="store_true",
                         help="publish bridge H.264 over separate live socket and FFmpeg process")
+    parser.add_argument("--scrcpy-direct-device", action="append", default=[],
+                        choices=DEVICE_IDS,
+                        help="opt in an independent raw H.264 RTSP side publisher at /<device>-direct")
+    parser.add_argument("--scrcpy-direct-script",
+                        default=str(Path(__file__).resolve().parent / "direct_rtsp_publisher.py"))
+    parser.add_argument("--scrcpy-direct-rtsp-base",
+                        help="optional separate localhost RTSP gateway for side publisher")
     parser.add_argument("--scrcpy-refresh-device", action="append", default=[],
                         choices=DEVICE_IDS,
                         help="allow rate-limited, on-demand idle video refresh for this device")
@@ -774,6 +852,17 @@ def main() -> None:
         parser.error("scrcpy-live-fanout requires a bridge device and RTSP base")
     if any(device not in config.scrcpy_bridge_device for device in config.scrcpy_refresh_device):
         parser.error("scrcpy-refresh-device requires that device in scrcpy-bridge-device")
+    if config.scrcpy_direct_device and not config.scrcpy_live_fanout:
+        parser.error("scrcpy-direct-device requires scrcpy-live-fanout")
+    if any(device not in config.scrcpy_bridge_device for device in config.scrcpy_direct_device):
+        parser.error("scrcpy-direct-device requires that device in scrcpy-bridge-device")
+    if config.scrcpy_direct_rtsp_base:
+        if not config.scrcpy_direct_device:
+            parser.error("scrcpy-direct-rtsp-base requires scrcpy-direct-device")
+        try:
+            validate_local_rtsp(config.scrcpy_direct_rtsp_base.rstrip("/") + "/probe")
+        except ValueError as exc:
+            parser.error(str(exc))
     if not 1 <= config.segment_seconds <= 180:
         parser.error("segment-seconds must be between 1 and 180")
     logging.basicConfig(level=logging.DEBUG if config.verbose else logging.INFO,

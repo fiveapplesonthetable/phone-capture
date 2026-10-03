@@ -1,0 +1,16 @@
+[Unit]
+Description=Optional direct phone live gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/phone-capture
+ExecStart=/path/to/mediamtx /path/to/phone-capture/direct-mediamtx.yml
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

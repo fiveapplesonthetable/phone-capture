@@ -27,6 +27,22 @@ The daemon scans the default ADB server and any additional sockets every three s
 
 A VM-local Cuttlefish emulator can use the same bridge. Add `--scrcpy-bridge-device cuttlefish` when it appears in plain `adb devices`; the viewer ID is `cuttlefish`. Its rolling archive lives under the emulator's `/sdcard/Movies/PhoneCapture/` and obeys the same size setting and free-space reserve.
 
+### Optional direct live side path
+
+The bridge can expose the same encoded H.264 packets on a bounded `<device-id>.raw.sock` Unix socket. `direct_rtsp_publisher.py` sends them to a second local MediaMTX gateway with PyAV, without decoding or re-encoding. The existing `.live.sock` publisher and phone archive continue independently. Enable this per device with `--scrcpy-direct-device <device-id>` and point `--scrcpy-direct-rtsp-base` at the second gateway. A raw reader requests a fresh keyframe on connection instead of replaying a cached group of pictures.
+
+`direct-mediamtx.yml` is a second-gateway example on RTSP port 18555 and WHEP port 18890. Run it with `mediamtx direct-mediamtx.yml` and supervise it with your service manager. Replace the placeholders in `phone-capture-direct-gateway.service` for a systemd user service.
+
+```bash
+python3 phone_capture.py --token-file /path/to/viewer/phone_token \
+  --scrcpy-bridge-device pixel-4-xl --scrcpy-live-fanout \
+  --scrcpy-rtsp-base rtsp://127.0.0.1:8554 \
+  --scrcpy-direct-device pixel-4-xl \
+  --scrcpy-direct-rtsp-base rtsp://127.0.0.1:18555
+```
+
+The side path publishes `pixel-4-xl-direct` (or the corresponding opted-in device ID). If its gateway disappears, only the side publisher restarts; the original RTSP stream and MP4 recording continue. The daemon also checks for a publisher stuck on a gateway that restarted while the screen was static. A viewer can prefer the side WHEP path and fall back to the original. Keep the normal thermal guard active on physical phones.
+
 For viewers that request a fresh picture after an unchanged screen, `--scrcpy-refresh-device cuttlefish` opts that device into a one-shot `{"type":"refresh_video"}` control request. The bridge only acts when the live stream has been idle for at least two seconds and limits requests to one per 20 seconds. Other devices remain unchanged unless explicitly opted in.
 
 Set `PHONE_CAPTURE_TOKEN_FILE` and any `PHONE_CAPTURE_ADB_SERVER_SOCKETS`/`PHONE_CAPTURE_STATE_DIR` values in `~/.config/phone-capture/env`. Edit the loopback RTSP address in the example `phone-capture.service`, then install it in `~/.config/systemd/user/` and run `systemctl --user enable --now phone-capture.service`. It starts after the viewer and retries uploads if the viewer restarts. Use `journalctl --user -u phone-capture.service -f` for logs.

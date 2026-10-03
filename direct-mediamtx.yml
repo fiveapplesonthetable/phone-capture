@@ -1,0 +1,26 @@
+# Optional low-latency side gateway. The existing live gateway remains available.
+readTimeout: 24h
+logLevel: info
+rtsp: true
+rtspTransports: [tcp]
+rtspAddress: 127.0.0.1:18555
+webrtc: true
+webrtcAddress: 127.0.0.1:18890
+webrtcAllowOrigins: ["http://127.0.0.1:18890"]
+webrtcLocalUDPAddress: :18190
+webrtcIPsFromInterfaces: true
+rtmp: false
+hls: false
+srt: false
+moq: false
+api: false
+metrics: false
+pprof: false
+playback: false
+paths:
+  pixel-4-direct:
+    source: publisher
+  pixel-4-xl-direct:
+    source: publisher
+  cuttlefish-direct:
+    source: publisher
