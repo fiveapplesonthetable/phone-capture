@@ -12,8 +12,10 @@ import json
 import logging
 import os
 import re
+import select
 import shutil
 import signal
+import sys
 import subprocess
 import threading
 import time
@@ -60,6 +62,76 @@ def thermal_state(health: int | None, temperature_c: float | None,
     return False
 
 
+def scrcpy_tunnel_host(socket: str) -> str:
+    """Return the reachable host of a remote ADB TCP server."""
+    if not socket.startswith("tcp:"):
+        raise ValueError("scrcpy tunnel requires a TCP ADB server socket")
+    host, separator, port = socket[4:].rpartition(":")
+    if not separator or not host or not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise ValueError("invalid TCP ADB server socket")
+    return host
+
+
+def scrcpy_start_allowed(health: int | None, temperature_c: float | None,
+                         maximum_c: float) -> bool:
+    """Keep experimental continuous transport off warm or unhealthy phones."""
+    return health == 2 and temperature_c is not None and temperature_c < maximum_c
+
+
+def validate_local_rtsp(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    if (parsed.scheme != "rtsp" or parsed.username or parsed.password
+            or parsed.hostname not in ("127.0.0.1", "localhost")
+            or not parsed.port or not parsed.path.startswith("/")):
+        raise ValueError("RTSP target must be localhost with an explicit port and path")
+    return url
+
+
+def scrcpy_ffmpeg_command(ffmpeg: str, fifo: str, output: str,
+                          segment_seconds: int, start_number: int,
+                          rtsp_url: str | None = None,
+                          mpegts_input: bool = False) -> list[str]:
+    """Encode scrcpy's timestamped stream once into archive and live RTSP."""
+    slaves = (f"[f=segment:segment_time={segment_seconds}:"
+              f"segment_start_number={start_number}:reset_timestamps=1]{output}")
+    if rtsp_url:
+        slaves += ("|[f=fifo:onfail=ignore:fifo_format=rtsp:attempt_recovery=1:"
+                   "recover_any_error=1:recovery_wait_time=1:drop_pkts_on_overflow=1:"
+                   "restart_with_keyframe=1:queue_size=30:format_opts=rtsp_transport=tcp]"
+                   + rtsp_url)
+    input_args = ["-f", "mpegts"] if mpegts_input else []
+    return [ffmpeg, "-hide_banner", "-loglevel", "warning", "-nostdin",
+            *input_args, "-i", fifo, "-map", "0:v:0", "-an", "-vf", "fps=10",
+            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+            "-pix_fmt", "yuv420p", "-bf", "0", "-crf", "24", "-g", "10",
+            "-keyint_min", "10", "-sc_threshold", "0", "-f", "tee", slaves]
+
+
+def scrcpy_live_ffmpeg_command(ffmpeg: str, socket: str, rtsp_url: str) -> list[str]:
+    """Publish the bridge's independent H.264 stream without encoding it."""
+    return [ffmpeg, "-hide_banner", "-loglevel", "warning", "-nostdin",
+            "-f", "mpegts", "-i", "unix://" + socket,
+            "-map", "0:v:0", "-an", "-c:v", "copy", "-f", "rtsp",
+            "-rtsp_transport", "tcp", validate_local_rtsp(rtsp_url)]
+
+
+def scrcpy_bridge_command(script: str, device_id: str, serial: str,
+                          adb_socket: str | None,
+                          server_jar: str | None = None,
+                          bit_rate: str = "4M", max_size: int = 720) -> list[str]:
+    command = [sys.executable, script, "--device-id", device_id, "--serial", serial]
+    if adb_socket:
+        command += ["--adb-server-socket", adb_socket,
+                    "--tunnel-host", scrcpy_tunnel_host(adb_socket)]
+    if server_jar:
+        command += ["--server-jar", server_jar]
+    multiplier = {"K": 1000, "M": 1_000_000}
+    suffix = bit_rate[-1].upper()
+    rate = int(bit_rate[:-1]) * multiplier[suffix] if suffix in multiplier else int(bit_rate)
+    command += ["--bit-rate", str(rate), "--max-size", str(max_size)]
+    return command
+
+
 def adb(serial: str | None, *args: str, socket: str | None = None,
         timeout: int = 30) -> subprocess.CompletedProcess[str]:
     command = ["adb"]
@@ -97,9 +169,12 @@ class PhoneWorker:
         self.session_id: str | None = None
         self.capture_process: subprocess.Popen | None = None
         self.mux_process: subprocess.Popen | None = None
+        self.live_process: subprocess.Popen | None = None
         self.retry_after: dict[str, float] = {}
         self.session_started = 0.0
         self.paused_hot = False
+        self.bridge_failures = 0
+        self.bridge_disabled = False
 
     def adb(self, *args: str, timeout: int = 30) -> subprocess.CompletedProcess[str]:
         return adb(self.serial, *args, socket=self.socket, timeout=timeout)
@@ -195,7 +270,24 @@ class PhoneWorker:
                 self.stop.wait(5)
                 continue
             sid = self.session_id
-            if self.socket:
+            if (self.device_id in self.config.scrcpy_bridge_device
+                    and not self.bridge_disabled):
+                reading = self.battery()
+                if scrcpy_start_allowed(reading["battery_health"], reading["temperature_c"],
+                                        self.config.scrcpy_max_start_c):
+                    self.run_scrcpy_bridge(sid)
+                    continue
+                LOG.info("scrcpy bridge waiting for cooler %s battery (%s); using MP4 fallback",
+                         self.device_id, reading)
+            use_scrcpy = (self.device_id in self.config.scrcpy_remote_device)
+            if use_scrcpy:
+                reading = self.battery()
+                if not scrcpy_start_allowed(reading["battery_health"], reading["temperature_c"],
+                                            self.config.scrcpy_max_start_c):
+                    LOG.info("scrcpy waiting for cooler %s battery (%s); using MP4 fallback",
+                             self.device_id, reading)
+                    use_scrcpy = False
+            if self.socket and not use_scrcpy:
                 self.run_screenrecord(sid)
                 continue
             local_dir = self.root / sid
@@ -204,18 +296,18 @@ class PhoneWorker:
             fifo.unlink(missing_ok=True)
             os.mkfifo(fifo, 0o600)
             output = str(local_dir / "%010d.mp4")
-            ffmpeg_command = [self.config.ffmpeg, "-hide_banner", "-loglevel", "warning",
-                              "-i", str(fifo), "-map", "0:v:0", "-an",
-                              "-vf", "fps=10", "-c:v", "libx264", "-preset", "ultrafast",
-                              "-crf", "24", "-g", "50", "-keyint_min", "50",
-                              "-sc_threshold", "0", "-f", "segment", "-segment_time",
-                              str(self.config.segment_seconds), "-segment_start_number",
-                              str(int(time.time())), "-reset_timestamps", "1", output]
+            rtsp_url = (self.config.scrcpy_rtsp_base.rstrip("/") + "/" + self.device_id
+                        if use_scrcpy and self.config.scrcpy_rtsp_base else None)
+            ffmpeg_command = scrcpy_ffmpeg_command(
+                self.config.ffmpeg, str(fifo), output, self.config.segment_seconds,
+                int(time.time()), rtsp_url)
             scrcpy_command = [self.config.scrcpy, "--serial", self.serial,
                               "--no-playback", "--no-control", "--no-audio",
                               "--max-size", str(self.config.max_size),
                               "--video-bit-rate", self.config.bit_rate,
                               "--record-format=mkv", "--record", str(fifo)]
+            if self.socket:
+                scrcpy_command.append("--tunnel-host=" + scrcpy_tunnel_host(self.socket))
             env = dict(os.environ)
             env["SDL_VIDEODRIVER"] = "dummy"
             if self.socket:
@@ -236,6 +328,14 @@ class PhoneWorker:
                             if self.check_thermal():
                                 LOG.warning("Stopping %s capture while battery is hot", self.device_id)
                                 break
+                            if use_scrcpy:
+                                reading = self.battery()
+                                if not scrcpy_start_allowed(
+                                        reading["battery_health"], reading["temperature_c"],
+                                        min(50.0, self.config.scrcpy_max_start_c + 3.0)):
+                                    LOG.warning("scrcpy reached warm cutoff on %s (%s)",
+                                                self.device_id, reading)
+                                    break
                         if time.monotonic() - self.session_started >= self.config.session_seconds:
                             LOG.info("Rotating hour-long %s session", self.device_id)
                             break
@@ -264,6 +364,116 @@ class PhoneWorker:
             self.stop.wait(3)
         if self.session_id:
             self.stop_session(self.session_id)
+
+    def run_scrcpy_bridge(self, sid: str) -> None:
+        """One scrcpy server carries timestamped video and interactive controls."""
+        local_dir = self.root / sid
+        local_dir.mkdir(parents=True, exist_ok=True)
+        runtime_dir = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+        video_socket = runtime_dir / "phone-capture" / f"{self.device_id}.video.sock"
+        live_socket = runtime_dir / "phone-capture" / f"{self.device_id}.live.sock"
+        control_socket = runtime_dir / "phone-capture" / f"{self.device_id}.control.sock"
+        bridge_command = scrcpy_bridge_command(
+            self.config.scrcpy_bridge_script, self.device_id, self.serial, self.socket,
+            str(Path(self.config.scrcpy).parent / "scrcpy-server"),
+            self.config.bit_rate, self.config.max_size)
+        rtsp_url = (self.config.scrcpy_rtsp_base.rstrip("/") + "/" + self.device_id
+                    if self.config.scrcpy_rtsp_base else None)
+        fanout = self.config.scrcpy_live_fanout and rtsp_url is not None
+        ffmpeg_command = scrcpy_ffmpeg_command(
+            self.config.ffmpeg, "unix://" + str(video_socket),
+            str(local_dir / "%010d.mp4"), self.config.segment_seconds,
+            int(time.time()), None if fanout else rtsp_url, mpegts_input=True)
+        live_command = (scrcpy_live_ffmpeg_command(self.config.ffmpeg, str(live_socket), rtsp_url)
+                        if fanout and rtsp_url else None)
+        cycle_started = time.monotonic()
+        try:
+            with (local_dir / "scrcpy-bridge.log").open("ab") as bridge_log, \
+                    (local_dir / "ffmpeg.log").open("ab") as ffmpeg_log, \
+                    (local_dir / "ffmpeg-live.log").open("ab") as live_log:
+                self.capture_process = subprocess.Popen(
+                    bridge_command, stdout=subprocess.PIPE, stderr=bridge_log)
+                deadline = time.monotonic() + 45
+                while not self.stop.is_set() and time.monotonic() < deadline:
+                    if self.capture_process.poll() is not None:
+                        raise OSError("scrcpy bridge exited before readiness")
+                    assert self.capture_process.stdout is not None
+                    if select.select([self.capture_process.stdout], [], [], 0.1)[0]:
+                        line = self.capture_process.stdout.readline()
+                        bridge_log.write(line)
+                        bridge_log.flush()
+                        if (line.startswith(b"READY ") and video_socket.exists()
+                                and control_socket.exists() and (not fanout or live_socket.exists())):
+                            break
+                else:
+                    raise OSError("scrcpy bridge did not become ready within 45 seconds")
+                if live_command:
+                    self.live_process = subprocess.Popen(
+                        live_command, stdout=live_log, stderr=live_log)
+                self.mux_process = subprocess.Popen(
+                    ffmpeg_command, stdout=ffmpeg_log, stderr=ffmpeg_log)
+                LOG.info("Capturing %s via scrcpy bridge", self.device_id)
+                last_thermal_check = time.monotonic()
+                live_restart_at = 0.0
+                while not self.stop.wait(1):
+                    self.upload_wakeup.set()
+                    if live_command and self.live_process and self.live_process.poll() is not None:
+                        LOG.warning("Live RTSP publisher stopped on %s; archive continues", self.device_id)
+                        self.live_process = None
+                        live_restart_at = time.monotonic() + 3
+                    if live_command and self.live_process is None and time.monotonic() >= live_restart_at:
+                        try:
+                            self.live_process = subprocess.Popen(
+                                live_command, stdout=live_log, stderr=live_log)
+                        except OSError as exc:
+                            LOG.warning("Cannot restart live publisher on %s: %s", self.device_id, exc)
+                            live_restart_at = time.monotonic() + 5
+                    if time.monotonic() - last_thermal_check >= 5:
+                        last_thermal_check = time.monotonic()
+                        if self.check_thermal():
+                            LOG.warning("Stopping %s scrcpy bridge while battery is hot", self.device_id)
+                            break
+                        reading = self.battery()
+                        if not scrcpy_start_allowed(
+                                reading["battery_health"], reading["temperature_c"],
+                                min(50.0, self.config.scrcpy_max_start_c + 3.0)):
+                            LOG.warning("scrcpy bridge reached warm cutoff on %s (%s)",
+                                        self.device_id, reading)
+                            break
+                    if time.monotonic() - self.session_started >= self.config.session_seconds:
+                        break
+                    if self.capture_process.poll() is not None or self.mux_process.poll() is not None:
+                        LOG.warning("scrcpy bridge stopped on %s; restarting", self.device_id)
+                        break
+        except OSError as exc:
+            LOG.warning("scrcpy bridge failed on %s: %s", self.device_id, exc)
+        finally:
+            if self.capture_process and self.capture_process.poll() is None:
+                self.capture_process.terminate()
+            for process in (self.live_process, self.capture_process, self.mux_process):
+                if process:
+                    try:
+                        process.wait(timeout=8)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+            if self.capture_process and self.capture_process.stdout:
+                self.capture_process.stdout.close()
+            self.capture_process = self.mux_process = self.live_process = None
+            self.upload_wakeup.set()
+            if not self.stop.is_set() and not self.paused_hot:
+                if time.monotonic() - cycle_started < 10:
+                    self.bridge_failures += 1
+                    if self.bridge_failures >= 3:
+                        self.bridge_disabled = True
+                        LOG.error("Disabling scrcpy bridge for %s after three rapid failures; using MP4 fallback",
+                                  self.device_id)
+                else:
+                    self.bridge_failures = 0
+            if self.session_id:
+                self.stop_session(sid)
+                self.session_id = None
+            self.stop.wait(3)
 
     def run_screenrecord(self, sid: str) -> None:
         """Fallback for ADB servers on another host (scrcpy tunnel is local)."""
@@ -311,8 +521,6 @@ class PhoneWorker:
             remote_dir = f"{PHONE_ROOT}/{sid}"
             if mirrored.exists() and mirrored.read_text().strip():
                 remote_path = mirrored.read_text().strip()
-            elif self.socket:
-                remote_path = f"{remote_dir}/{filename}"
             else:
                 remote_dir = f"{PHONE_ROOT}/{sid}"
                 mkdir = self.adb("shell", "mkdir", "-p", remote_dir, timeout=10)
@@ -495,6 +703,19 @@ class PhoneWorker:
                 self.stop_session(directory.name)
 
 
+def stop_workers(workers: dict, segment_seconds: int) -> None:
+    """Drain workers, including devices whose uploader never started."""
+    for worker in workers.values():
+        worker.stop.set()
+    for worker in workers.values():
+        if worker.thread.ident is not None:
+            worker.thread.join(timeout=segment_seconds + 20)
+        if worker.uploader.ident is not None:
+            worker.uploader.join(timeout=10)
+        if worker.device_id:
+            worker.upload_pending()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", default="http://127.0.0.1:8765")
@@ -512,10 +733,35 @@ def main() -> None:
     parser.add_argument("--poll-seconds", type=float, default=3)
     parser.add_argument("--max-host-gib", type=float, default=2)
     parser.add_argument("--session-seconds", type=int, default=3600)
+    parser.add_argument("--scrcpy-remote-device", action="append", default=[],
+                        choices=("pixel-4", "pixel-4-xl"),
+                        help="opt in a device to scrcpy through its ADB server")
+    parser.add_argument("--scrcpy-bridge-device", action="append", default=[],
+                        choices=("pixel-4", "pixel-4-xl"),
+                        help="opt in a device to one scrcpy video/control bridge")
+    parser.add_argument("--scrcpy-bridge-script",
+                        default=str(Path(__file__).resolve().parent / "scrcpy_bridge.py"))
+    parser.add_argument("--scrcpy-rtsp-base",
+                        help="optional localhost RTSP base; each device publishes to /<device-id>")
+    parser.add_argument("--scrcpy-live-fanout", action="store_true",
+                        help="publish bridge H.264 over separate live socket and FFmpeg process")
+    parser.add_argument("--scrcpy-max-start-c", type=float, default=45.0,
+                        help="start opt-in scrcpy only below this battery temperature")
     parser.add_argument("--verbose", action="store_true")
     config = parser.parse_args()
     if not (os.environ.get("RECORDINGS_PHONE_TOKEN") or config.token_file):
         parser.error("set RECORDINGS_PHONE_TOKEN or --token-file / PHONE_CAPTURE_TOKEN_FILE")
+    if not 30 <= config.scrcpy_max_start_c <= 50:
+        parser.error("scrcpy-max-start-c must be between 30 and 50")
+    if config.scrcpy_rtsp_base:
+        if not config.scrcpy_remote_device and not config.scrcpy_bridge_device:
+            parser.error("scrcpy-rtsp-base requires a scrcpy device")
+        try:
+            validate_local_rtsp(config.scrcpy_rtsp_base.rstrip("/") + "/pixel-4")
+        except ValueError as exc:
+            parser.error(str(exc))
+    if config.scrcpy_live_fanout and (not config.scrcpy_bridge_device or not config.scrcpy_rtsp_base):
+        parser.error("scrcpy-live-fanout requires a bridge device and RTSP base")
     if not 1 <= config.segment_seconds <= 180:
         parser.error("segment-seconds must be between 1 and 180")
     logging.basicConfig(level=logging.DEBUG if config.verbose else logging.INFO,
@@ -547,12 +793,7 @@ def main() -> None:
     except KeyboardInterrupt:
         LOG.info("Stopping")
     finally:
-        for worker in workers.values():
-            worker.stop.set()
-        for worker in workers.values():
-            worker.thread.join(timeout=config.segment_seconds + 20)
-            worker.uploader.join(timeout=10)
-            worker.upload_pending()
+        stop_workers(workers, config.segment_seconds)
 
 
 if __name__ == "__main__":

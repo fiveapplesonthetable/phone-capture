@@ -1,35 +1,57 @@
 # Phone Capture
 
-Screen capture for plugged-in Pixel 4 and Pixel 4 XL phones. A host daemon watches ADB. Phones connected through the local ADB server use [scrcpy](https://github.com/Genymobile/scrcpy) in headless recording mode and FFmpeg to make short MP4 clips from one continuous stream. Phones reached through an ADB server on another host use Android `screenrecord` because scrcpy's local video tunnel cannot cross that setup. The daemon archives each completed clip in `/sdcard/Movies/PhoneCapture/<session-id>/` on the phone and uploads it to a recordings viewer for live playback and history.
+Screen capture for plugged-in Pixel 4 and Pixel 4 XL phones. A host daemon watches ADB. In bridge mode, one [scrcpy](https://github.com/Genymobile/scrcpy) server per phone supplies timestamped H.264 video and an interactive control channel over ADB. FFmpeg sends that video to a local RTSP/WebRTC gateway and closes short MP4 clips for the phone archive and [recordings](https://github.com/fiveapplesonthetable/recordings) viewer history. The bridge works through a remote ADB server without opening a TCP port on the phone or ADB host.
 
 This captures the **screen**, including tests and app UI. It does not activate the phone camera or microphone. Those can be added as separate tracks later.
 
 ## Requirements
 
-- Python 3.10+, `adb`, `ffmpeg`, and a running recordings viewer on `127.0.0.1:8765`.
-- USB debugging authorized on each phone. If a phone uses another ADB server, set `PHONE_CAPTURE_ADB_SERVER_SOCKETS` to its socket address.
-- The viewer's phone token file must be readable by the user running this daemon. Point `PHONE_CAPTURE_TOKEN_FILE` to it, or set `RECORDINGS_PHONE_TOKEN` in the service environment.
+- Python 3.10+, `adb`, `ffmpeg`, [PyAV](https://pyav.org/), and a running recordings viewer.
+- USB debugging authorized on each phone. Additional ADB servers can be supplied with `--adb-server-socket tcp:<host>:5037`.
+- A viewer phone token readable through `--token-file`, or `RECORDINGS_PHONE_TOKEN` in the service environment.
 - `scrcpy` 4.1. Run `./install_scrcpy.sh`; it checks the release tarball SHA-256 before extraction. Its binary is kept under `.tools/` and excluded from git.
+- Java 8+ and Android SDK platform/build tools for the small Android abstract-socket relay. `scrcpy_relay/build.sh` builds it on the first bridge start; set `ANDROID_HOME` if the SDK is outside the usual location.
+- A local RTSP/WebRTC gateway such as MediaMTX for browser playback. Set `--scrcpy-rtsp-base` to its loopback RTSP address without a device path.
 
 ## Run
 
 ```bash
 ./install_scrcpy.sh
-python3 phone_capture.py --token-file /path/to/recordings/phone_token
+python3 phone_capture.py --token-file /path/to/viewer/phone_token \
+  --adb-server-socket tcp:<adb-host>:5037 \
+  --scrcpy-bridge-device pixel-4 --scrcpy-bridge-device pixel-4-xl \
+  --scrcpy-rtsp-base rtsp://127.0.0.1:8554 --scrcpy-live-fanout --max-size 1520
 ```
 
-The daemon scans the default ADB server and configured additional sockets every three seconds, identifies the phones by Android model, and assigns stable viewer IDs `pixel-4` and `pixel-4-xl`. Add a remote socket with `--adb-server-socket tcp:192.0.2.10:5037` or the `PHONE_CAPTURE_ADB_SERVER_SOCKETS` environment variable (comma-separated for multiple sockets). It starts a new session after each connection or scrcpy restart. Both phones can record concurrently. It uses `SDL_VIDEODRIVER=dummy` so no desktop session is required.
+The daemon scans the default ADB server and any additional sockets every three seconds, identifies the phones by Android model, and assigns stable viewer IDs `pixel-4` and `pixel-4-xl`. Both phones can run the same bridge path. Each bridge exposes mode-0600 Unix video and control sockets under `$XDG_RUNTIME_DIR/phone-capture/`; the viewer can send touch and key events through its control socket. With `--scrcpy-live-fanout`, one FFmpeg process copies H.264 to RTSP while another independently encodes archived MP4 clips. If RTSP fails, recording continues and the live publisher retries. The service needs no desktop session.
 
-Install the example `phone-capture.service` in `~/.config/systemd/user/`. It assumes this repository is checked out at `~/phone-capture` and requires a `recordings-viewer.service` user unit; edit the paths and unit dependency for your setup. Create `~/.config/phone-capture/env` with `PHONE_CAPTURE_TOKEN_FILE=/path/to/recordings/phone_token`. Add `PHONE_CAPTURE_ADB_SERVER_SOCKETS=tcp:192.0.2.10:5037` if needed, and `PHONE_CAPTURE_STATE_DIR=/path/on/a/data/drive/phone-capture` if the default spool location is too small. Keep the environment file private (`chmod 600`). Then run `systemctl --user enable --now phone-capture.service`. Use `journalctl --user -u phone-capture.service -f` for logs.
+Set `PHONE_CAPTURE_TOKEN_FILE` and any `PHONE_CAPTURE_ADB_SERVER_SOCKETS`/`PHONE_CAPTURE_STATE_DIR` values in `~/.config/phone-capture/env`. Edit the loopback RTSP address in the example `phone-capture.service`, then install it in `~/.config/systemd/user/` and run `systemctl --user enable --now phone-capture.service`. It starts after the viewer and retries uploads if the viewer restarts. Use `journalctl --user -u phone-capture.service -f` for logs.
 
 ## Retention and latency
 
-The viewer's per-device settings choose a size in GiB or a percent of the phone's total storage; default is **50%**. The daemon reads `df -k /sdcard` and prunes the oldest archived MP4s when the archive exceeds the limit or free phone storage falls below 5 GiB. It notifies the viewer of pruned clips so history matches what remains on the phone. Uploads are idempotent. Host state lives under `state/` inside the checkout by default, with a **2 GiB per-phone pending-clip limit**. The phone is archived first. If the viewer is unavailable long enough for the host spool to fill, a durable marker lets the daemon fetch the clip back from the phone when the viewer returns.
+The viewer's per-device settings choose a size in GiB or a percent of the phone's total storage; default is **50%**. The daemon reads `df -k /sdcard` and prunes the oldest archived MP4s when the archive exceeds the limit or free phone storage falls below 5 GiB. It notifies the viewer of pruned clips so history matches what remains on the phone. Uploads are idempotent. Host state defaults to `state/` beside the daemon, with a **2 GiB per-phone pending-clip limit**. The phone is archived first. If the viewer is unavailable long enough for the VM spool to fill, a durable marker lets the daemon fetch the clip back from the phone when the viewer returns.
 
-Scrcpy capture is continuous, so there is no planned gap between its clips. `screenrecord` restarts after each clip and pull, leaving a brief gap. Closed clips reach the viewer about one segment duration plus transfer time after capture; the default segment target is five seconds. On a static screen, Android's encoder may emit few frames, which delays scrcpy clip closure until new frames arrive. The live player holds its last image during that pause.
+Scrcpy bridge capture is continuous on either phone, so there is no planned gap between its clips. Closed clips reach the viewer about one segment duration plus transfer time after capture; the default segment target is five seconds. The live RTSP/WebRTC feed is available before a clip closes. If the bridge fails repeatedly, capture returns to the existing `screenrecord` fallback. On a static screen, Android's encoder may emit few frames, which delays clip closure until new frames arrive; live playback holds the last image.
 
-Logical sessions rotate hourly so history playlists stay small. The Pixel 4 scrcpy pipeline restarts briefly at rotation. Status reports the phone's battery level, **battery temperature** (not ambient room temperature), storage capacity/free space, and ADB route.
+Logical sessions rotate hourly so history playlists stay small. The scrcpy pipeline restarts briefly at rotation. Status reports the phone's battery level, **battery temperature** (not ambient room temperature), storage capacity/free space, and ADB route.
 
 Capture pauses if Android reports battery health `OVERHEAT` (3), another unhealthy battery state, or the battery reaches the 50°C hard limit. Android reports `GOOD` as 2; a `GOOD` phone near 45°C keeps capturing. After a pause, it resumes when health is `GOOD` and temperature is at most 48°C. If health is unavailable, temperature controls the same 50/48°C fallback; if both readings are unavailable, capture pauses. The daemon keeps reporting battery status and checks for recovery every ten seconds. The phone's last recordings remain available in history during a pause. [Android BatteryManager constants](https://developer.android.com/reference/android/os/BatteryManager#BATTERY_HEALTH_OVERHEAT)
 
 The viewer API used is `POST /api/phones/{id}/sessions`, `POST /api/phones/{id}/segments?session_id=…&segment_key=…&captured_at=…&remote_path=…`, `POST /api/phones/{id}/sessions/{session_id}/stop`, `GET /api/phones/{id}/settings`, `POST /api/phones/{id}/status`, and `POST /api/phones/{id}/archive-prune`. Write calls send `X-Phone-Token`. The viewer can re-fetch older clips from `remote_path` through the reported ADB route after its live TS cache rotates out.
+
+## Scrcpy protocol bridge
+
+`scrcpy_bridge.py` is a single-encoder video/control bridge for either device ID. It launches the pinned scrcpy 4.1 server on the selected Android device, receives its H.264 packets with their original presentation timestamps, and serves independent reconnectable MPEG-TS streams at `$XDG_RUNTIME_DIR/phone-capture/<device-id>.video.sock` for archive and `<device-id>.live.sock` for RTSP. Slow archive processing cannot block live video. JSON lines sent to `<device-id>.control.sock` drive the same scrcpy server's control channel (tap, touch down/move/up, swipe, key, or text). All Unix sockets are mode 0600 in a mode 0700 directory.
+The bridge also requires Python PyAV (`import av`) for MPEG-TS muxing.
+
+The bridge works when the phone uses a remote ADB server. The remote host may bind `adb forward` to its own loopback, so the bridge instead starts two tiny Android `app_process` relays over binary `adb shell -T` channels. Both relays connect to the scrcpy server's abstract video/control sockets. They do not start another encoder. The relay source is `scrcpy_relay/AbstractRelay.java`; the build script compiles a temporary DEX JAR with Android SDK platform 34 and build-tools 34.0.0. Set `ANDROID_HOME` if the SDK is outside `~/Android/Sdk`. The JAR stays under `.tools/` and is excluded from Git.
+
+Example with the remote ADB server (replace the serial and server JAR path as needed):
+
+```bash
+./install_scrcpy.sh
+python3 scrcpy_bridge.py --device-id pixel-4-xl --serial <adb-serial> \
+  --adb-server-socket tcp:192.0.2.10:5037
+```
+
+The process prints `READY <video.sock> <live.sock> <control.sock>` after both relays connect. Separate FFmpeg processes consume the archive and live sockets without starting another phone encoder. On exit the bridge stops the scrcpy server, closes its Unix sockets, and removes its temporary JARs from Android. Use the daemon's thermal guard before starting real-device capture; direct use of the bridge does not add thermal policy.
