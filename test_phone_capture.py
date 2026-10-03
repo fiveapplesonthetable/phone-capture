@@ -1,13 +1,139 @@
 import argparse
+import shutil
+import socket
+import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from phone_capture import PhoneWorker, is_archive_path, thermal_state
+from phone_capture import (PhoneWorker, is_archive_path, scrcpy_bridge_command,
+                           scrcpy_ffmpeg_command, scrcpy_live_ffmpeg_command,
+                           scrcpy_start_allowed, scrcpy_tunnel_host, stop_workers,
+                           thermal_state, validate_local_rtsp)
 
 
 class ArchiveTests(unittest.TestCase):
+    def test_remote_tunnel_and_cool_start_are_device_independent(self):
+        self.assertEqual(scrcpy_tunnel_host("tcp:192.0.2.10:5037"), "192.0.2.10")
+        with self.assertRaises(ValueError):
+            scrcpy_tunnel_host("localabstract:adb")
+        self.assertTrue(scrcpy_start_allowed(2, 44.9, 45.0))
+        self.assertFalse(scrcpy_start_allowed(3, 40.0, 45.0))
+        self.assertFalse(scrcpy_start_allowed(2, 45.0, 45.0))
+        self.assertEqual(validate_local_rtsp("rtsp://127.0.0.1:18554/pixel-4"),
+                         "rtsp://127.0.0.1:18554/pixel-4")
+        with self.assertRaises(ValueError):
+            validate_local_rtsp("rtsp://192.0.2.10:18554/pixel-4")
+        command = scrcpy_bridge_command("/tmp/scrcpy_bridge.py", "pixel-4-xl",
+                                        "TEST123", "tcp:192.0.2.10:5037")
+        self.assertEqual(command[6:10], ["--adb-server-socket", "tcp:192.0.2.10:5037",
+                                         "--tunnel-host", "192.0.2.10"])
+        self.assertIn("4000000", command)
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg unavailable")
+    def test_scrcpy_mkv_stream_yields_playable_archive_clips(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            source = folder / "scrcpy.mkv"
+            subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                            "-i", "testsrc2=size=320x480:rate=10:duration=7",
+                            "-c:v", "libx264", "-g", "10", str(source)], check=True)
+            command = scrcpy_ffmpeg_command("ffmpeg", str(source),
+                                            str(folder / "%010d.mp4"), 3, 100)
+            subprocess.run(command, check=True, capture_output=True)
+            clips = sorted(folder.glob("*.mp4"))
+            self.assertGreaterEqual(len(clips), 2)
+            for clip in clips:
+                result = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                                         "stream=codec_name", "-of", "default=nw=1:nk=1",
+                                         str(clip)], check=True, capture_output=True, text=True)
+                self.assertIn("h264", result.stdout)
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg unavailable")
+    def test_bridge_mpegts_unix_stream_yields_archive_clips(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            source = folder / "bridge.ts"
+            subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                            "-i", "testsrc2=size=320x480:rate=10:duration=6",
+                            "-c:v", "libx264", "-g", "10", "-f", "mpegts", str(source)],
+                           check=True)
+            socket_path = folder / "video.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(socket_path))
+            listener.listen(1)
+            def serve():
+                with listener:
+                    connection, _ = listener.accept()
+                    with connection:
+                        connection.sendall(source.read_bytes())
+            server = threading.Thread(target=serve)
+            server.start()
+            try:
+                command = scrcpy_ffmpeg_command("ffmpeg", "unix://" + str(socket_path),
+                                                str(folder / "%010d.mp4"), 3, 200,
+                                                mpegts_input=True)
+                subprocess.run(command, check=True, capture_output=True, timeout=20)
+            finally:
+                server.join(timeout=5)
+            self.assertGreaterEqual(len(list(folder.glob("*.mp4"))), 2)
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg unavailable")
+    def test_live_gateway_failure_does_not_stop_archive(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            source = folder / "bridge.ts"
+            subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                            "-i", "testsrc2=size=320x480:rate=10:duration=6",
+                            "-c:v", "libx264", "-g", "10", "-f", "mpegts", str(source)],
+                           check=True)
+            listeners = []
+            servers = []
+            for name in ("archive", "live"):
+                path = folder / f"{name}.sock"
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                listener.bind(str(path))
+                listener.listen(1)
+                listeners.append(listener)
+                def serve(sock=listener):
+                    with sock:
+                        connection, _ = sock.accept()
+                        with connection:
+                            connection.sendall(source.read_bytes())
+                server = threading.Thread(target=serve)
+                server.start()
+                servers.append(server)
+            archive = scrcpy_ffmpeg_command("ffmpeg", "unix://" + str(folder / "archive.sock"),
+                                            str(folder / "%010d.mp4"), 3, 200,
+                                            mpegts_input=True)
+            live = scrcpy_live_ffmpeg_command("ffmpeg", str(folder / "live.sock"),
+                                               "rtsp://127.0.0.1:1/test")
+            self.assertEqual(live[live.index("-c:v") + 1], "copy")
+            live_proc = subprocess.Popen(live, stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
+            try:
+                subprocess.run(archive, check=True, capture_output=True, timeout=20)
+                self.assertNotEqual(live_proc.wait(timeout=10), 0)
+            finally:
+                if live_proc.poll() is None:
+                    live_proc.kill()
+                    live_proc.wait(timeout=5)
+                for server in servers:
+                    server.join(timeout=5)
+            clips = sorted(folder.glob("*.mp4"))
+            self.assertGreaterEqual(len(clips), 2)
+            subprocess.run(["ffprobe", "-v", "error", str(clips[-1])],
+                           check=True, capture_output=True)
+
+    def test_shutdown_skips_uploader_for_unidentified_device(self):
+        worker = SimpleNamespace(stop=threading.Event(), thread=threading.Thread(),
+                                 uploader=threading.Thread(), device_id=None,
+                                 upload_pending=lambda: self.fail("unidentified worker flushed"))
+        stop_workers({"missing-phone": worker}, 5)
+        self.assertTrue(worker.stop.is_set())
+
     def test_thermal_guard_pauses_on_overheat_and_waits_for_cooldown(self):
         self.assertTrue(thermal_state(3, 45.7, False))
         self.assertFalse(thermal_state(2, 44.9, False))
@@ -86,6 +212,30 @@ class ArchiveTests(unittest.TestCase):
             worker.upload_one = lambda sid, clip: seen.append((sid, clip.name)) or True
             worker.upload_pending()
             self.assertEqual(seen, [("abc123", "1791044403.mp4")])
+
+    def test_remote_adb_bridge_clip_is_mirrored_before_viewer_upload(self):
+        with tempfile.TemporaryDirectory() as temp:
+            worker = object.__new__(PhoneWorker)
+            worker.socket = "tcp:192.0.2.10:5037"
+            worker.device_id = "pixel-4-xl"
+            worker.config = argparse.Namespace(segment_seconds=5)
+            worker.retry_after = {}
+            clip = Path(temp) / "1791044403.mp4"
+            clip.write_bytes(b"test clip")
+            actions = []
+            def fake_adb(*args, **_kwargs):
+                actions.append(args[0])
+                return SimpleNamespace(returncode=0, stderr="")
+            worker.adb = fake_adb
+            def fake_request(method, path, data, content_type):
+                self.assertTrue(clip.with_suffix(".mirrored").exists())
+                self.assertIn("remote_path=%2Fsdcard%2FMovies%2FPhoneCapture", path)
+                actions.append("upload")
+                return {}
+            worker.request = fake_request
+            self.assertTrue(worker.upload_one("abc123", clip))
+            self.assertEqual(actions, ["shell", "push", "upload"])
+            self.assertFalse(clip.exists())
 
 
 if __name__ == "__main__":

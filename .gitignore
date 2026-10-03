@@ -6,3 +6,4 @@ __pycache__/
 *.mkv
 .env
 state/
+scrcpy_relay/build/
