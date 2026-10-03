@@ -15,6 +15,21 @@ from phone_capture import (PhoneWorker, is_archive_path, scrcpy_bridge_command,
 
 
 class ArchiveTests(unittest.TestCase):
+    def test_cuttlefish_uses_stable_viewer_id_on_local_adb(self):
+        worker = object.__new__(PhoneWorker)
+        worker.serial = "0.0.0.0:6520"
+        worker.socket = None
+        worker.adb = lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout="Cuttlefish x86_64 phone\n")
+        self.assertTrue(worker.identify())
+        self.assertEqual(worker.device_id, "cuttlefish")
+        command = scrcpy_bridge_command("/tmp/scrcpy_bridge.py", worker.device_id,
+                                        worker.serial, worker.socket,
+                                        allow_video_refresh=True)
+        self.assertIn("cuttlefish", command)
+        self.assertNotIn("--adb-server-socket", command)
+        self.assertIn("--allow-video-refresh", command)
+
     def test_remote_tunnel_and_cool_start_are_device_independent(self):
         self.assertEqual(scrcpy_tunnel_host("tcp:192.0.2.10:5037"), "192.0.2.10")
         with self.assertRaises(ValueError):
@@ -31,6 +46,7 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(command[6:10], ["--adb-server-socket", "tcp:192.0.2.10:5037",
                                          "--tunnel-host", "192.0.2.10"])
         self.assertIn("4000000", command)
+        self.assertNotIn("--allow-video-refresh", command)
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg unavailable")
     def test_scrcpy_mkv_stream_yields_playable_archive_clips(self):

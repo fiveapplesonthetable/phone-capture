@@ -25,6 +25,10 @@ python3 phone_capture.py --token-file /path/to/viewer/phone_token \
 
 The daemon scans the default ADB server and any additional sockets every three seconds, identifies the phones by Android model, and assigns stable viewer IDs `pixel-4` and `pixel-4-xl`. Both phones can run the same bridge path. Each bridge exposes mode-0600 Unix video and control sockets under `$XDG_RUNTIME_DIR/phone-capture/`; the viewer can send touch and key events through its control socket. With `--scrcpy-live-fanout`, one FFmpeg process copies H.264 to RTSP while another independently encodes archived MP4 clips. If RTSP fails, recording continues and the live publisher retries. The service needs no desktop session.
 
+A VM-local Cuttlefish emulator can use the same bridge. Add `--scrcpy-bridge-device cuttlefish` when it appears in plain `adb devices`; the viewer ID is `cuttlefish`. Its rolling archive lives under the emulator's `/sdcard/Movies/PhoneCapture/` and obeys the same size setting and free-space reserve.
+
+For viewers that request a fresh picture after an unchanged screen, `--scrcpy-refresh-device cuttlefish` opts that device into a one-shot `{"type":"refresh_video"}` control request. The bridge only acts when the live stream has been idle for at least two seconds and limits requests to one per 20 seconds. Other devices remain unchanged unless explicitly opted in.
+
 Set `PHONE_CAPTURE_TOKEN_FILE` and any `PHONE_CAPTURE_ADB_SERVER_SOCKETS`/`PHONE_CAPTURE_STATE_DIR` values in `~/.config/phone-capture/env`. Edit the loopback RTSP address in the example `phone-capture.service`, then install it in `~/.config/systemd/user/` and run `systemctl --user enable --now phone-capture.service`. It starts after the viewer and retries uploads if the viewer restarts. Use `journalctl --user -u phone-capture.service -f` for logs.
 
 ## Retention and latency

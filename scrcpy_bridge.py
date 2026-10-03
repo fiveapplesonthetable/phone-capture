@@ -202,8 +202,8 @@ class ScrcpyBridge:
     def __init__(self, *, device_id: str, serial: str, adb_server_socket: str | None,
                  tunnel_host: str, server_jar: Path, relay_jar: Path, runtime_dir: Path,
                  bit_rate: int = 4_000_000, max_size: int = 720, max_fps: int = 30,
-                 i_frame_interval: int = 1):
-        if device_id not in ("pixel-4", "pixel-4-xl"):
+                 i_frame_interval: int = 1, allow_video_refresh: bool = False):
+        if device_id not in ("pixel-4", "pixel-4-xl", "cuttlefish"):
             raise ValueError("unknown device id")
         if not serial or any(c.isspace() for c in serial):
             raise ValueError("invalid ADB serial")
@@ -219,6 +219,7 @@ class ScrcpyBridge:
         if not 1 <= i_frame_interval <= 10:
             raise ValueError("I-frame interval must be 1–10 seconds")
         self.i_frame_interval = i_frame_interval
+        self.allow_video_refresh = allow_video_refresh
         self.env = dict(os.environ)
         if adb_server_socket:
             self.env["ADB_SERVER_SOCKET"] = adb_server_socket
@@ -243,6 +244,8 @@ class ScrcpyBridge:
         self.width = 0
         self.height = 0
         self.config_packets: list[bytes] = []
+        self.last_video_packet_at = time.monotonic()
+        self.last_video_refresh_at = 0.0
         self.control_lock = threading.Lock()
         self.stop = threading.Event()
 
@@ -400,6 +403,7 @@ class ScrcpyBridge:
                 self.config_packets.append(payload)
                 self.config_packets = self.config_packets[-4:]
                 continue
+            self.last_video_packet_at = time.monotonic()
             if not self.sinks or not self.width or not self.height:
                 continue
             config = b"".join(self.config_packets) if is_key else b""
@@ -412,11 +416,24 @@ class ScrcpyBridge:
         self.control.sendall(touch_message(action, payload.get("x"), payload.get("y"),
                                            self.width, self.height))
 
-    def _control_request(self, payload: dict) -> None:
+    def _control_request(self, payload: dict) -> bool | None:
         assert self.control
         kind = payload.get("type")
         with self.control_lock:
-            if kind == "key":
+            if kind == "refresh_video":
+                if not self.allow_video_refresh:
+                    raise ValueError("video refresh is disabled")
+                now = time.monotonic()
+                # Viewer joins need one fresh IDR only when the source has been idle.
+                # A bounded rate prevents repeated page loads from restarting capture.
+                if ("live" in self.sinks and now - self.last_video_packet_at >= 2
+                        and now - self.last_video_refresh_at >= 20):
+                    self.control.sendall(bytes([17]))  # TYPE_RESET_VIDEO
+                    self.last_video_refresh_at = now
+                    LOG.info("Requested one idle video refresh for %s", self.device_id)
+                    return True
+                return False
+            elif kind == "key":
                 key = payload.get("key")
                 if not isinstance(key, str) or key not in KEYCODES:
                     raise ValueError("unsupported key")
@@ -466,8 +483,11 @@ class ScrcpyBridge:
                 payload = json.loads(data.split(b"\n", 1)[0])
                 if not isinstance(payload, dict):
                     raise ValueError("control request must be an object")
-                self._control_request(payload)
-                conn.sendall(b'{"ok":true}\n')
+                refreshed = self._control_request(payload)
+                if payload.get("type") == "refresh_video":
+                    conn.sendall(json.dumps({"ok": True, "refreshed": bool(refreshed)}).encode() + b"\n")
+                else:
+                    conn.sendall(b'{"ok":true}\n')
             except (ValueError, json.JSONDecodeError) as exc:
                 conn.sendall(json.dumps({"error": str(exc)}).encode() + b"\n")
             except OSError:
@@ -541,7 +561,8 @@ class ScrcpyBridge:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--device-id", required=True, choices=("pixel-4", "pixel-4-xl"))
+    parser.add_argument("--device-id", required=True,
+                        choices=("pixel-4", "pixel-4-xl", "cuttlefish"))
     parser.add_argument("--serial", required=True)
     parser.add_argument("--adb-server-socket")
     parser.add_argument("--tunnel-host", default="127.0.0.1")
@@ -553,6 +574,8 @@ def main() -> None:
     parser.add_argument("--max-fps", type=int, default=30)
     parser.add_argument("--i-frame-interval", type=int, default=1,
                         help="scrcpy encoder keyframe interval in seconds (1–10)")
+    parser.add_argument("--allow-video-refresh", action="store_true",
+                        help="allow rate-limited keyframe request for an idle new viewer")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     bridge = ScrcpyBridge(device_id=args.device_id, serial=args.serial,
@@ -561,7 +584,8 @@ def main() -> None:
                           relay_jar=args.relay_jar,
                           runtime_dir=args.runtime_dir, bit_rate=args.bit_rate,
                           max_size=args.max_size, max_fps=args.max_fps,
-                          i_frame_interval=args.i_frame_interval)
+                          i_frame_interval=args.i_frame_interval,
+                          allow_video_refresh=args.allow_video_refresh)
     def shutdown(_signal, _frame):
         bridge.stop.set()
     signal.signal(signal.SIGTERM, shutdown)

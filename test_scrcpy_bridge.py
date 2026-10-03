@@ -16,6 +16,41 @@ from scrcpy_bridge import AdbPipe, ScrcpyBridge, VideoSink, exact, key_message, 
 
 
 class ScrcpyProtocolTests(unittest.TestCase):
+    def test_idle_video_refresh_is_opt_in_and_rate_limited(self):
+        class FakeControl:
+            def __init__(self):
+                self.sent = []
+            def sendall(self, data):
+                self.sent.append(data)
+        with tempfile.TemporaryDirectory() as temp:
+            kwargs = dict(device_id="cuttlefish", serial="TEST", adb_server_socket=None,
+                          tunnel_host="127.0.0.1", server_jar=Path(temp)/"server.jar",
+                          relay_jar=Path(temp)/"relay.jar", runtime_dir=Path(temp))
+            bridge = ScrcpyBridge(**kwargs)
+            bridge.control = FakeControl()
+            bridge.sinks["live"] = object()
+            bridge.last_video_packet_at = time.monotonic() - 3
+            with self.assertRaises(ValueError):
+                bridge._control_request({"type":"refresh_video"})
+            self.assertEqual(bridge.control.sent, [])
+            bridge.allow_video_refresh = True
+            self.assertTrue(bridge._control_request({"type":"refresh_video"}))
+            self.assertFalse(bridge._control_request({"type":"refresh_video"}))
+            self.assertEqual(bridge.control.sent, [bytes([17])])
+            bridge.last_video_refresh_at = time.monotonic() - 21
+            bridge.last_video_packet_at = time.monotonic()
+            self.assertFalse(bridge._control_request({"type":"refresh_video"}))
+            self.assertEqual(len(bridge.control.sent), 1)
+
+    def test_cuttlefish_bridge_id_is_accepted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            bridge = ScrcpyBridge(device_id="cuttlefish", serial="0.0.0.0:6520",
+                                  adb_server_socket=None, tunnel_host="127.0.0.1",
+                                  server_jar=Path(temp) / "server.jar",
+                                  relay_jar=Path(temp) / "relay.jar",
+                                  runtime_dir=Path(temp))
+            self.assertEqual(bridge.device_id, "cuttlefish")
+
     def test_short_keyframe_interval_is_bounded_for_live_join(self):
         with tempfile.TemporaryDirectory() as temp:
             kwargs = dict(device_id="pixel-4-xl", serial="TEST", adb_server_socket=None,
