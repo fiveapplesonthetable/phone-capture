@@ -1,8 +1,7 @@
 [Unit]
 Description=Continuous Pixel screen capture for recordings viewer
 After=network-online.target recordings-viewer.service
-Wants=network-online.target
-Requires=recordings-viewer.service
+Wants=network-online.target recordings-viewer.service
 
 [Service]
 Type=simple
