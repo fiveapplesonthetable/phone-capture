@@ -12,7 +12,8 @@ import shutil
 
 import av
 
-from scrcpy_bridge import AdbPipe, ScrcpyBridge, VideoSink, exact, key_message, text_message, touch_message
+from scrcpy_bridge import (AdbPipe, ScrcpyBridge, VideoSink, exact, key_message,
+                           text_message, touch_message, touch_pointer_id)
 
 
 class ScrcpyProtocolTests(unittest.TestCase):
@@ -150,6 +151,62 @@ class ScrcpyProtocolTests(unittest.TestCase):
         for coordinate in (-0.01, 1.01, float("nan"), True):
             with self.assertRaises(ValueError):
                 touch_message(0, coordinate, 0.5, 304, 720)
+
+    def test_two_pointers_use_distinct_scrcpy_ids_and_cancel_releases_both(self):
+        class FakeControl:
+            def __init__(self):
+                self.sent = []
+            def sendall(self, data):
+                self.sent.append(data)
+        with tempfile.TemporaryDirectory() as temp:
+            bridge = ScrcpyBridge(device_id="cuttlefish", serial="TEST",
+                                  adb_server_socket=None, tunnel_host="127.0.0.1",
+                                  server_jar=Path(temp)/"server.jar",
+                                  relay_jar=Path(temp)/"relay.jar",
+                                  runtime_dir=Path(temp))
+            bridge.control = FakeControl()
+            bridge.width, bridge.height = 304, 720
+            for pointer_id, x in ((0, .3), (1, .7)):
+                bridge._control_request({"type": "touch", "action": "down",
+                                         "pointer_id": pointer_id, "x": x, "y": .5})
+            bridge._control_request({"type": "touch", "action": "move",
+                                     "pointer_id": 0, "x": .2, "y": .5, "pressure": .5})
+            bridge._control_request({"type": "touch", "action": "move",
+                                     "pointer_id": 1, "x": .8, "y": .5})
+            bridge._control_request({"type": "touch", "action": "cancel"})
+            sent = [struct.unpack(">BBQIIHHHII", msg) for msg in bridge.control.sent]
+            self.assertEqual([(msg[1], msg[2]) for msg in sent],
+                             [(0, 0), (0, 1), (2, 0), (2, 1), (1, 1), (1, 0)])
+            self.assertEqual(sent[2][7], round(.5 * 65535))
+            self.assertEqual(bridge.active_pointers, {})
+            bridge._control_request({"type": "touch", "action": "up",
+                                     "pointer_id": 1, "x": .8, "y": .5})
+            self.assertEqual(len(bridge.control.sent), 6)
+
+    def test_touch_sequence_and_pointer_values_are_bounded(self):
+        for value in (-1, 10, True, 1.5, "1"):
+            with self.assertRaises(ValueError):
+                touch_pointer_id(value)
+        for pressure in (-.1, 1.1, float("nan")):
+            with self.assertRaises(ValueError):
+                touch_message(0, .5, .5, 304, 720, 0, pressure)
+        with tempfile.TemporaryDirectory() as temp:
+            bridge = ScrcpyBridge(device_id="cuttlefish", serial="TEST",
+                                  adb_server_socket=None, tunnel_host="127.0.0.1",
+                                  server_jar=Path(temp)/"server.jar",
+                                  relay_jar=Path(temp)/"relay.jar",
+                                  runtime_dir=Path(temp))
+            bridge.control = type("FakeControl", (), {"sendall": lambda *_: None})()
+            bridge.width, bridge.height = 304, 720
+            with self.assertRaisesRegex(ValueError, "active pointer"):
+                bridge._control_request({"type": "touch", "action": "move",
+                                         "pointer_id": 0, "x": .5, "y": .5})
+            bridge._control_request({"type": "touch", "action": "down",
+                                     "pointer_id": 0, "x": .5, "y": .5})
+            bridge.last_touch_at = time.monotonic() - 20
+            # The same release path is used by the idle watchdog and shutdown.
+            bridge._cancel_touches()
+            self.assertEqual(bridge.active_pointers, {})
 
     def test_text_is_utf8_and_bounded(self):
         self.assertEqual(text_message("Hi"), b"\x01\x00\x00\x00\x02Hi")

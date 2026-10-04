@@ -64,6 +64,14 @@ The viewer API used is `POST /api/phones/{id}/sessions`, `POST /api/phones/{id}/
 `scrcpy_bridge.py` is a single-encoder video/control bridge for either device ID. It launches the pinned scrcpy 4.1 server on the selected Android device, receives its H.264 packets with their original presentation timestamps, and serves independent reconnectable MPEG-TS streams at `$XDG_RUNTIME_DIR/phone-capture/<device-id>.video.sock` for archive and `<device-id>.live.sock` for RTSP. Slow archive processing cannot block live video. JSON lines sent to `<device-id>.control.sock` drive the same scrcpy server's control channel (tap, touch down/move/up, swipe, key, or text). All Unix sockets are mode 0600 in a mode 0700 directory.
 The bridge also requires Python PyAV (`import av`) for MPEG-TS muxing.
 
+Touch requests accept normalized `x`/`y` coordinates and an optional integer
+`pointer_id` from 0 to 9. Give each simultaneous finger a stable ID and send
+its own down, move, and up events; optional `pressure` ranges from 0 to 1.
+Omitting `pointer_id` keeps the existing single-finger behavior. A touch
+`cancel` request releases every active finger, as does 15 seconds without
+touch input or bridge shutdown. For example, a pinch starts with two down
+requests with different IDs, moves both IDs, then releases both.
+
 The bridge works when the phone uses a remote ADB server. The remote host may bind `adb forward` to its own loopback, so the bridge instead starts two tiny Android `app_process` relays over binary `adb shell -T` channels. Both relays connect to the scrcpy server's abstract video/control sockets. They do not start another encoder. The relay source is `scrcpy_relay/AbstractRelay.java`; the build script compiles a temporary DEX JAR with Android SDK platform 34 and build-tools 34.0.0. Set `ANDROID_HOME` if the SDK is outside `~/Android/Sdk`. The JAR stays under `.tools/` and is excluded from Git.
 
 Example with the remote ADB server (replace the serial and server JAR path as needed):

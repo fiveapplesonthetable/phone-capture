@@ -32,6 +32,8 @@ LOG = logging.getLogger("scrcpy_bridge")
 VERSION = "4.1"
 MAX_PACKET = 8 * 1024 * 1024
 MAX_REQUEST = 4096
+VIRTUAL_POINTER_ID = 0xFFFFFFFFFFFFFFFE
+TOUCH_IDLE_TIMEOUT = 15.0
 KEYCODES = {
     "BACK": 4, "HOME": 3, "ENTER": 66, "APP_SWITCH": 187,
     "POWER": 26, "VOLUME_UP": 24, "VOLUME_DOWN": 25,
@@ -236,14 +238,27 @@ def key_message(keycode: int, action: int) -> bytes:
     return struct.pack(">BBIII", 0, action, keycode, 0, 0)
 
 
-def touch_message(action: int, x: float, y: float, width: int, height: int) -> bytes:
+def touch_pointer_id(value: object) -> int:
+    if value is None:
+        return VIRTUAL_POINTER_ID  # Existing single-pointer browser controls.
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 9:
+        raise ValueError("pointer_id must be an integer from 0 to 9")
+    return value
+
+
+def touch_message(action: int, x: float, y: float, width: int, height: int,
+                  pointer_id: int = VIRTUAL_POINTER_ID, pressure: float = 1.0) -> bytes:
+    if action not in (0, 1, 2):
+        raise ValueError("unsupported touch action")
     if not (1 <= width <= 65535 and 1 <= height <= 65535):
         raise ValueError("video size unavailable")
+    if pointer_id != VIRTUAL_POINTER_ID:
+        touch_pointer_id(pointer_id)
     px = round(number(x) * (width - 1))
     py = round(number(y) * (height - 1))
-    pressure = 0 if action == 1 else 65535
-    return struct.pack(">BBQIIHHHII", 2, action, 0xFFFFFFFFFFFFFFFE,
-                       px, py, width, height, pressure, 0, 0)
+    encoded_pressure = 0 if action == 1 else round(number(pressure) * 65535)
+    return struct.pack(">BBQIIHHHII", 2, action, pointer_id,
+                       px, py, width, height, encoded_pressure, 0, 0)
 
 
 def text_message(text: str) -> bytes:
@@ -309,6 +324,8 @@ class ScrcpyBridge:
         self.last_video_refresh_at = 0.0
         self.followup_refresh_available_until = 0.0
         self.control_lock = threading.Lock()
+        self.active_pointers: dict[int, tuple[float, float]] = {}
+        self.last_touch_at = 0.0
         self.stop = threading.Event()
 
     def adb(self, *args: str, timeout: float = 15) -> subprocess.CompletedProcess:
@@ -485,8 +502,32 @@ class ScrcpyBridge:
 
     def _send_touch(self, action: int, payload: dict) -> None:
         assert self.control
-        self.control.sendall(touch_message(action, payload.get("x"), payload.get("y"),
-                                           self.width, self.height))
+        pointer_id = touch_pointer_id(payload.get("pointer_id"))
+        x, y = number(payload.get("x")), number(payload.get("y"))
+        if action == 0 and pointer_id in self.active_pointers:
+            old_x, old_y = self.active_pointers[pointer_id]
+            self.control.sendall(touch_message(1, old_x, old_y,
+                                               self.width, self.height, pointer_id))
+            self.active_pointers.pop(pointer_id)
+        if action == 2 and pointer_id not in self.active_pointers:
+            raise ValueError("touch move requires an active pointer")
+        if action == 1 and pointer_id not in self.active_pointers:
+            return  # A retried release is safe and idempotent.
+        self.control.sendall(touch_message(action, x, y, self.width, self.height,
+                                           pointer_id, payload.get("pressure", 1.0)))
+        if action == 1:
+            self.active_pointers.pop(pointer_id, None)
+        else:
+            self.active_pointers[pointer_id] = (x, y)
+        self.last_touch_at = time.monotonic()
+
+    def _cancel_touches(self) -> None:
+        if self.control:
+            for pointer_id, (x, y) in reversed(list(self.active_pointers.items())):
+                self.control.sendall(touch_message(1, x, y, self.width, self.height,
+                                                   pointer_id))
+        self.active_pointers.clear()
+        self.last_touch_at = 0.0
 
     def _control_request(self, payload: dict) -> bool | None:
         assert self.control
@@ -527,6 +568,9 @@ class ScrcpyBridge:
                 time.sleep(.025)
                 self._send_touch(1, payload)
             elif kind == "touch":
+                if payload.get("action") == "cancel":
+                    self._cancel_touches()
+                    return None
                 action = {"down": 0, "up": 1, "move": 2}.get(payload.get("action"))
                 if action is None:
                     raise ValueError("unsupported touch action")
@@ -577,6 +621,13 @@ class ScrcpyBridge:
     def _control_loop(self) -> None:
         assert self.control_listener
         while not self.stop.is_set():
+            with self.control_lock:
+                if (self.active_pointers and
+                        time.monotonic() - self.last_touch_at >= TOUCH_IDLE_TIMEOUT):
+                    try:
+                        self._cancel_touches()
+                    except OSError:
+                        self.active_pointers.clear()
             try:
                 conn, _ = self.control_listener.accept()
             except socket.timeout:
@@ -619,6 +670,11 @@ class ScrcpyBridge:
             if self.lock_file:
                 self.lock_file.close()
             return
+        with self.control_lock:
+            try:
+                self._cancel_touches()
+            except OSError:
+                self.active_pointers.clear()
         for sink in self.sinks.values():
             sink.close()
         self.sinks.clear()
