@@ -145,7 +145,8 @@ def scrcpy_bridge_command(script: str, device_id: str, serial: str,
                           server_jar: str | None = None,
                           bit_rate: str = "4M", max_size: int = 720,
                           allow_video_refresh: bool = False,
-                          raw_live_socket: bool = False) -> list[str]:
+                          raw_live_socket: bool = False,
+                          webcodecs_socket: bool = False) -> list[str]:
     command = [sys.executable, script, "--device-id", device_id, "--serial", serial]
     if adb_socket:
         command += ["--adb-server-socket", adb_socket,
@@ -160,6 +161,8 @@ def scrcpy_bridge_command(script: str, device_id: str, serial: str,
         command.append("--allow-video-refresh")
     if raw_live_socket:
         command.append("--raw-live-socket")
+    if webcodecs_socket:
+        command.append("--webcodecs-socket")
     return command
 
 
@@ -411,7 +414,8 @@ class PhoneWorker:
             str(Path(self.config.scrcpy).parent / "scrcpy-server"),
             self.config.bit_rate, self.config.max_size,
             self.device_id in self.config.scrcpy_refresh_device,
-            self.device_id in self.config.scrcpy_direct_device)
+            self.device_id in self.config.scrcpy_direct_device,
+            self.device_id in self.config.scrcpy_webcodecs_device)
         rtsp_url = (self.config.scrcpy_rtsp_base.rstrip("/") + "/" + self.device_id
                     if self.config.scrcpy_rtsp_base else None)
         fanout = self.config.scrcpy_live_fanout and rtsp_url is not None
@@ -826,6 +830,9 @@ def main() -> None:
     parser.add_argument("--scrcpy-direct-device", action="append", default=[],
                         choices=DEVICE_IDS,
                         help="opt in an independent raw H.264 RTSP side publisher at /<device>-direct")
+    parser.add_argument("--scrcpy-webcodecs-device", action="append", default=[],
+                        choices=DEVICE_IDS,
+                        help="offer a bounded framed H.264 Unix socket for this device")
     parser.add_argument("--scrcpy-direct-script",
                         default=str(Path(__file__).resolve().parent / "direct_rtsp_publisher.py"))
     parser.add_argument("--scrcpy-direct-rtsp-base",
@@ -856,6 +863,8 @@ def main() -> None:
         parser.error("scrcpy-direct-device requires scrcpy-live-fanout")
     if any(device not in config.scrcpy_bridge_device for device in config.scrcpy_direct_device):
         parser.error("scrcpy-direct-device requires that device in scrcpy-bridge-device")
+    if any(device not in config.scrcpy_bridge_device for device in config.scrcpy_webcodecs_device):
+        parser.error("scrcpy-webcodecs-device requires that device in scrcpy-bridge-device")
     if config.scrcpy_direct_rtsp_base:
         if not config.scrcpy_direct_device:
             parser.error("scrcpy-direct-rtsp-base requires scrcpy-direct-device")

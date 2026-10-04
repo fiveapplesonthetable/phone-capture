@@ -275,7 +275,7 @@ class ScrcpyBridge:
                  tunnel_host: str, server_jar: Path, relay_jar: Path, runtime_dir: Path,
                  bit_rate: int = 4_000_000, max_size: int = 720, max_fps: int = 30,
                  i_frame_interval: int = 1, allow_video_refresh: bool = False,
-                 raw_live_socket: bool = False):
+                 raw_live_socket: bool = False, webcodecs_socket: bool = False):
         if device_id not in ("pixel-4", "pixel-4-xl", "cuttlefish"):
             raise ValueError("unknown device id")
         if not serial or any(c.isspace() for c in serial):
@@ -294,6 +294,7 @@ class ScrcpyBridge:
         self.i_frame_interval = i_frame_interval
         self.allow_video_refresh = allow_video_refresh
         self.raw_live_socket = raw_live_socket
+        self.webcodecs_socket = webcodecs_socket
         self.env = dict(os.environ)
         if adb_server_socket:
             self.env["ADB_SERVER_SOCKET"] = adb_server_socket
@@ -304,6 +305,7 @@ class ScrcpyBridge:
         self.video_socket_path = runtime_dir / f"{device_id}.video.sock"
         self.live_socket_path = runtime_dir / f"{device_id}.live.sock"
         self.raw_live_socket_path = runtime_dir / f"{device_id}.raw.sock"
+        self.webcodecs_socket_path = runtime_dir / f"{device_id}.webcodecs.sock"
         self.control_socket_path = runtime_dir / f"{device_id}.control.sock"
         self.server_process: subprocess.Popen | None = None
         self.lock_file = None
@@ -315,6 +317,7 @@ class ScrcpyBridge:
         self.video_listener: socket.socket | None = None
         self.live_listener: socket.socket | None = None
         self.raw_live_listener: socket.socket | None = None
+        self.webcodecs_listener: socket.socket | None = None
         self.control_listener: socket.socket | None = None
         self.sinks: dict[str, VideoSink | RawVideoSink] = {}
         self.width = 0
@@ -426,7 +429,7 @@ class ScrcpyBridge:
         previous = self.sinks.pop(name, None)
         if previous:
             previous.close()
-        if name == "raw_live":
+        if name in ("raw_live", "webcodecs"):
             self.sinks[name] = RawVideoSink(reader, self.width, self.height)
         else:
             self.sinks[name] = VideoSink(name, reader, self.width, self.height,
@@ -447,6 +450,8 @@ class ScrcpyBridge:
             listeners = [self.video_listener, self.live_listener]
             if self.raw_live_listener:
                 listeners.append(self.raw_live_listener)
+            if self.webcodecs_listener:
+                listeners.append(self.webcodecs_listener)
             ready, _, _ = select.select([self.video, *listeners], [], [], .25)
             if self.video_listener in ready:
                 try:
@@ -461,6 +466,11 @@ class ScrcpyBridge:
             if self.raw_live_listener and self.raw_live_listener in ready:
                 try:
                     self._accept_reader("raw_live", self.raw_live_listener)
+                except BlockingIOError:
+                    pass
+            if self.webcodecs_listener and self.webcodecs_listener in ready:
+                try:
+                    self._accept_reader("webcodecs", self.webcodecs_listener)
                 except BlockingIOError:
                     pass
             if self.video not in ready:
@@ -548,7 +558,8 @@ class ScrcpyBridge:
                             now - self.last_video_refresh_at >= .5)
                 initial = (now - self.last_video_packet_at >= 2 and
                            now - self.last_video_refresh_at >= 20)
-                if ("live" in self.sinks or "raw_live" in self.sinks) and (followup or initial):
+                has_live_sink = any(name in self.sinks for name in ("live", "raw_live", "webcodecs"))
+                if has_live_sink and (followup or initial):
                     self.control.sendall(bytes([17]))  # TYPE_RESET_VIDEO
                     self.last_video_refresh_at = now
                     self.followup_refresh_available_until = (0.0 if followup else now + 20)
@@ -650,11 +661,15 @@ class ScrcpyBridge:
             self.live_listener = self._listen(self.live_socket_path)
             if self.raw_live_socket:
                 self.raw_live_listener = self._listen(self.raw_live_socket_path)
+            if self.webcodecs_socket:
+                self.webcodecs_listener = self._listen(self.webcodecs_socket_path)
             self.control_listener = self._listen(self.control_socket_path)
             threading.Thread(target=self._control_loop, daemon=True).start()
             paths = [self.video_socket_path, self.live_socket_path, self.control_socket_path]
             if self.raw_live_socket:
                 paths.append(self.raw_live_socket_path)
+            if self.webcodecs_socket:
+                paths.append(self.webcodecs_socket_path)
             print("READY " + " ".join(map(str, paths)), flush=True)
             try:
                 self._video_loop()
@@ -679,11 +694,13 @@ class ScrcpyBridge:
             sink.close()
         self.sinks.clear()
         for s in (self.video, self.control, self.video_listener,
-                  self.live_listener, self.raw_live_listener, self.control_listener):
+                  self.live_listener, self.raw_live_listener, self.webcodecs_listener,
+                  self.control_listener):
             if s:
                 s.close()
         for path in (self.video_socket_path, self.live_socket_path,
-                     self.raw_live_socket_path, self.control_socket_path):
+                     self.raw_live_socket_path, self.webcodecs_socket_path,
+                     self.control_socket_path):
             path.unlink(missing_ok=True)
         if self.server_process:
             self.server_process.terminate()
@@ -720,6 +737,8 @@ def main() -> None:
                         help="allow rate-limited keyframe request for an idle new viewer")
     parser.add_argument("--raw-live-socket", action="store_true",
                         help="offer a bounded raw H.264 side socket for direct RTSP publishing")
+    parser.add_argument("--webcodecs-socket", action="store_true",
+                        help="offer an additional bounded framed H.264 socket")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     bridge = ScrcpyBridge(device_id=args.device_id, serial=args.serial,
@@ -730,7 +749,8 @@ def main() -> None:
                           max_size=args.max_size, max_fps=args.max_fps,
                           i_frame_interval=args.i_frame_interval,
                           allow_video_refresh=args.allow_video_refresh,
-                          raw_live_socket=args.raw_live_socket)
+                          raw_live_socket=args.raw_live_socket,
+                          webcodecs_socket=args.webcodecs_socket)
     def shutdown(_signal, _frame):
         bridge.stop.set()
     signal.signal(signal.SIGTERM, shutdown)

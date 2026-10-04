@@ -43,6 +43,24 @@ python3 phone_capture.py --token-file /path/to/viewer/phone_token \
 
 The side path publishes `pixel-4-xl-direct` (or the corresponding opted-in device ID). If its gateway disappears, only the side publisher restarts; the original RTSP stream and MP4 recording continue. The daemon also checks for a publisher stuck on a gateway that restarted while the screen was static. A viewer can prefer the side WHEP path and fall back to the original. Keep the normal thermal guard active on physical phones.
 
+### Optional browser codec side socket
+
+`--scrcpy-webcodecs-device <device-id>` adds a separate, mode-0600
+`<device-id>.webcodecs.sock` reader to the same scrcpy encoder. It is off by
+default and works for any configured bridge device. The archive and both RTSP
+publishers keep their existing sockets. The new socket has one reconnectable
+reader and a bounded queue; a slow reader is disconnected without blocking
+recording or the live publishers. A reader connection requests a fresh keyframe
+so a static screen can start decoding.
+
+The binary stream starts with `SCV1` and big-endian width/height (`uint16`
+each). Each access unit then has a big-endian keyframe byte, source PTS in
+microseconds (`uint64`), payload length (`uint32`), and Annex-B H.264 payload.
+The first keyframe includes SPS/PPS. A local WebSocket relay can expose this
+stream to a browser WebCodecs decoder; keep that relay on an authenticated
+viewer origin. For example, add `--scrcpy-webcodecs-device cuttlefish` alongside
+`--scrcpy-bridge-device cuttlefish` for an emulator trial.
+
 For viewers that request a fresh picture after an unchanged screen, `--scrcpy-refresh-device cuttlefish` opts that device into a one-shot `{"type":"refresh_video"}` control request. The bridge only acts when the live stream has been idle for at least two seconds and limits requests to one per 20 seconds. Other devices remain unchanged unless explicitly opted in.
 
 Set `PHONE_CAPTURE_TOKEN_FILE` and any `PHONE_CAPTURE_ADB_SERVER_SOCKETS`/`PHONE_CAPTURE_STATE_DIR` values in `~/.config/phone-capture/env`. Edit the loopback RTSP address in the example `phone-capture.service`, then install it in `~/.config/systemd/user/` and run `systemctl --user enable --now phone-capture.service`. It starts after the viewer and retries uploads if the viewer restarts. Use `journalctl --user -u phone-capture.service -f` for logs.
