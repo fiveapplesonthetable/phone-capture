@@ -75,7 +75,10 @@ class ArchiveTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             scrcpy_tunnel_host("localabstract:adb")
         self.assertTrue(scrcpy_start_allowed(2, 44.9, 45.0))
-        self.assertFalse(scrcpy_start_allowed(3, 40.0, 45.0))
+        self.assertTrue(scrcpy_start_allowed(3, 44.9, 45.0))
+        self.assertFalse(scrcpy_start_allowed(3, 48.1, 50.0))
+        self.assertFalse(scrcpy_start_allowed(3, 48.0, 48.0))
+        self.assertTrue(scrcpy_start_allowed(3, 40.0, 45.0))
         self.assertFalse(scrcpy_start_allowed(2, 45.0, 45.0))
         self.assertEqual(validate_local_rtsp("rtsp://127.0.0.1:18554/pixel-4"),
                          "rtsp://127.0.0.1:18554/pixel-4")
@@ -190,13 +193,18 @@ class ArchiveTests(unittest.TestCase):
         stop_workers({"missing-phone": worker}, 5)
         self.assertTrue(worker.stop.is_set())
 
-    def test_thermal_guard_pauses_on_overheat_and_waits_for_cooldown(self):
-        self.assertTrue(thermal_state(3, 45.7, False))
+    def test_thermal_guard_resumes_after_stale_overheat_cools(self):
+        self.assertTrue(thermal_state(3, 48.1, False))
+        self.assertFalse(thermal_state(3, 48.0, False))
+        self.assertTrue(thermal_state(3, None, False))
+        self.assertFalse(thermal_state(3, 35.1, True))
+        self.assertTrue(thermal_state(3, 48.5, True))
         self.assertFalse(thermal_state(2, 44.9, False))
         self.assertFalse(thermal_state(2, 45.1, False))
         self.assertTrue(thermal_state(2, 50.0, False))
         self.assertTrue(thermal_state(2, 48.5, True))
         self.assertFalse(thermal_state(2, 47.9, True))
+        self.assertTrue(thermal_state(2, None, True))
         self.assertTrue(thermal_state(None, None, False))
         self.assertFalse(thermal_state(None, 44.9, False))
         self.assertTrue(thermal_state(4, 40.0, False))
