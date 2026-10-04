@@ -11,7 +11,8 @@ from types import SimpleNamespace
 from phone_capture import (PhoneWorker, is_archive_path, scrcpy_bridge_command,
                            scrcpy_direct_rtsp_command, scrcpy_ffmpeg_command,
                            scrcpy_live_ffmpeg_command, rtsp_path_available,
-                           scrcpy_start_allowed, scrcpy_tunnel_host, stop_workers,
+                           scrcpy_continue_allowed, scrcpy_start_allowed,
+                           scrcpy_tunnel_host, stop_workers,
                            thermal_state, validate_local_rtsp)
 
 
@@ -81,6 +82,11 @@ class ArchiveTests(unittest.TestCase):
         self.assertFalse(scrcpy_start_allowed(3, 45.0, 45.0))
         self.assertTrue(scrcpy_start_allowed(3, 40.0, 45.0))
         self.assertFalse(scrcpy_start_allowed(2, 45.0, 45.0))
+        self.assertTrue(scrcpy_continue_allowed(3, 47.9, 48.0))
+        self.assertTrue(scrcpy_continue_allowed(3, 45.1, 46.0))
+        self.assertFalse(scrcpy_continue_allowed(3, 48.1, 50.0))
+        self.assertTrue(scrcpy_continue_allowed(2, 47.9, 49.0))
+        self.assertFalse(scrcpy_continue_allowed(2, 49.0, 49.0))
         self.assertEqual(validate_local_rtsp("rtsp://127.0.0.1:18554/pixel-4"),
                          "rtsp://127.0.0.1:18554/pixel-4")
         with self.assertRaises(ValueError):
@@ -91,6 +97,15 @@ class ArchiveTests(unittest.TestCase):
                                          "--tunnel-host", "192.0.2.10"])
         self.assertIn("4000000", command)
         self.assertNotIn("--allow-video-refresh", command)
+
+    def test_worker_starts_paused_until_thermal_state_is_checked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            token_file = Path(temp) / "token"
+            token_file.write_text("test-token")
+            worker = PhoneWorker("TEST123", None,
+                                 SimpleNamespace(state_dir=temp,
+                                                 token_file=str(token_file)))
+            self.assertTrue(worker.paused_hot)
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg unavailable")
     def test_scrcpy_mkv_stream_yields_playable_archive_clips(self):
@@ -199,6 +214,7 @@ class ArchiveTests(unittest.TestCase):
         self.assertFalse(thermal_state(3, 48.0, False))
         self.assertTrue(thermal_state(3, None, False))
         self.assertFalse(thermal_state(3, 35.1, True))
+        self.assertTrue(thermal_state(3, 47.9, True))
         self.assertFalse(thermal_state(3, 45.0, True))
         self.assertTrue(thermal_state(3, 45.1, True))
         self.assertTrue(thermal_state(3, 48.5, True))
