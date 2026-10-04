@@ -59,6 +59,38 @@ class ScrcpyProtocolTests(unittest.TestCase):
                                   runtime_dir=Path(temp))
             self.assertEqual(bridge.device_id, "cuttlefish")
 
+    def test_optional_webcodecs_socket_frames_h264_without_archive_consumer(self):
+        class FakeControl:
+            def __init__(self):
+                self.sent = []
+            def sendall(self, data):
+                self.sent.append(data)
+        with tempfile.TemporaryDirectory() as temp:
+            bridge = ScrcpyBridge(device_id="cuttlefish", serial="TEST",
+                                  adb_server_socket=None, tunnel_host="127.0.0.1",
+                                  server_jar=Path(temp) / "server.jar",
+                                  relay_jar=Path(temp) / "relay.jar",
+                                  runtime_dir=Path(temp), webcodecs_socket=True)
+            self.assertTrue(bridge.webcodecs_socket)
+            bridge.width, bridge.height = 642, 1520
+            bridge.control = FakeControl()
+            listener = bridge._listen(bridge.webcodecs_socket_path)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as reader:
+                reader.settimeout(2)
+                reader.connect(str(bridge.webcodecs_socket_path))
+                bridge._accept_reader("webcodecs", listener)
+                self.assertEqual(bridge.control.sent, [bytes([17])])
+                self.assertEqual(list(bridge.sinks), ["webcodecs"])
+                config = b"\x00\x00\x00\x01\x67\x42"
+                frame = b"\x00\x00\x00\x01\x65\xaa"
+                self.assertTrue(bridge.sinks["webcodecs"].offer(frame, 123456, True, config))
+                self.assertEqual(exact(reader, 8), b"SCV1" + struct.pack(">HH", 642, 1520))
+                key, pts, size = struct.unpack(">BQI", exact(reader, 13))
+                self.assertEqual((key, pts, size), (1, 123456, len(config + frame)))
+                self.assertEqual(exact(reader, size), config + frame)
+            bridge.sinks["webcodecs"].close()
+            listener.close()
+
     def test_short_keyframe_interval_is_bounded_for_live_join(self):
         with tempfile.TemporaryDirectory() as temp:
             kwargs = dict(device_id="pixel-4-xl", serial="TEST", adb_server_socket=None,

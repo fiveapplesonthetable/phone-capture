@@ -27,6 +27,13 @@ class ArchiveTests(unittest.TestCase):
         self.assertIn("18554/pixel-4-xl", legacy[-1])
         self.assertEqual(direct[-1], "rtsp://127.0.0.1:18555/pixel-4-xl-direct")
 
+    def test_webcodecs_side_socket_is_device_opt_in(self):
+        normal = scrcpy_bridge_command("/tmp/bridge.py", "pixel-4", "TEST", None)
+        enabled = scrcpy_bridge_command("/tmp/bridge.py", "cuttlefish", "TEST", None,
+                                        webcodecs_socket=True)
+        self.assertNotIn("--webcodecs-socket", normal)
+        self.assertIn("--webcodecs-socket", enabled)
+
     def test_direct_gateway_path_probe_detects_eviction_and_outage(self):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.bind(("127.0.0.1", 0))
