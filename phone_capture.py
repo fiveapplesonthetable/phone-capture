@@ -48,19 +48,17 @@ def is_archive_path(path: str) -> bool:
 
 def thermal_state(health: int | None, temperature_c: float | None,
                   was_paused: bool) -> bool:
-    """Follow Android health; use 50/48°C as a hard fallback and hysteresis."""
-    if health == 3:  # BatteryManager.BATTERY_HEALTH_OVERHEAT
-        return True
+    """Pause for hot batteries; tolerate stale OVERHEAT after cooling to 48°C."""
     if health in (4, 5, 6, 7):  # Other unhealthy battery states.
+        return True
+    if health not in (1, 2, 3, None):
         return True
     if temperature_c is not None and temperature_c >= 50:
         return True
-    if was_paused:
-        if health == 2:  # BatteryManager.BATTERY_HEALTH_GOOD
-            return temperature_c is not None and temperature_c > 48
+    if health == 3:  # BatteryManager may retain OVERHEAT after cooling.
         return temperature_c is None or temperature_c > 48
-    if health not in (1, 2, None):
-        return True
+    if was_paused:
+        return temperature_c is None or temperature_c > 48
     if health in (1, None) and temperature_c is None:
         return True
     return False
