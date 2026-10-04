@@ -83,6 +83,16 @@ def scrcpy_start_allowed(health: int | None, temperature_c: float | None,
     return health == 2 or (health == 3 and temperature_c <= 45)
 
 
+def scrcpy_continue_allowed(health: int | None, temperature_c: float | None,
+                            maximum_c: float) -> bool:
+    """Keep a running scrcpy stream until its health-specific warm cutoff."""
+    if temperature_c is None:
+        return False
+    if health == 3:
+        return temperature_c <= 48
+    return health == 2 and temperature_c < maximum_c
+
+
 def validate_local_rtsp(url: str) -> str:
     parsed = urllib.parse.urlparse(url)
     if (parsed.scheme != "rtsp" or parsed.username or parsed.password
@@ -208,7 +218,8 @@ class PhoneWorker:
         self.direct_process: subprocess.Popen | None = None
         self.retry_after: dict[str, float] = {}
         self.session_started = 0.0
-        self.paused_hot = False
+        # Fail closed until the first battery reading confirms a safe state.
+        self.paused_hot = True
         self.bridge_failures = 0
         self.bridge_disabled = False
 
@@ -366,7 +377,7 @@ class PhoneWorker:
                                 break
                             if use_scrcpy:
                                 reading = self.battery()
-                                if not scrcpy_start_allowed(
+                                if not scrcpy_continue_allowed(
                                         reading["battery_health"], reading["temperature_c"],
                                         min(50.0, self.config.scrcpy_max_start_c + 3.0)):
                                     LOG.warning("scrcpy reached warm cutoff on %s (%s)",
@@ -516,7 +527,7 @@ class PhoneWorker:
                             LOG.warning("Stopping %s scrcpy bridge while battery is hot", self.device_id)
                             break
                         reading = self.battery()
-                        if not scrcpy_start_allowed(
+                        if not scrcpy_continue_allowed(
                                 reading["battery_health"], reading["temperature_c"],
                                 min(50.0, self.config.scrcpy_max_start_c + 3.0)):
                             LOG.warning("scrcpy bridge reached warm cutoff on %s (%s)",
