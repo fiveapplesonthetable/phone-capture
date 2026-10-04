@@ -48,7 +48,7 @@ def is_archive_path(path: str) -> bool:
 
 def thermal_state(health: int | None, temperature_c: float | None,
                   was_paused: bool) -> bool:
-    """Pause for hot batteries; tolerate stale OVERHEAT after cooling to 48°C."""
+    """Pause for hot batteries; use 48/45°C hysteresis for stale OVERHEAT."""
     if health in (4, 5, 6, 7):  # Other unhealthy battery states.
         return True
     if health not in (1, 2, 3, None):
@@ -56,7 +56,8 @@ def thermal_state(health: int | None, temperature_c: float | None,
     if temperature_c is not None and temperature_c >= 50:
         return True
     if health == 3:  # BatteryManager may retain OVERHEAT after cooling.
-        return temperature_c is None or temperature_c > 48
+        resume_limit = 45 if was_paused else 48
+        return temperature_c is None or temperature_c > resume_limit
     if was_paused:
         return temperature_c is None or temperature_c > 48
     if health in (1, None) and temperature_c is None:
@@ -79,7 +80,7 @@ def scrcpy_start_allowed(health: int | None, temperature_c: float | None,
     """Keep experimental continuous transport off warm or unhealthy phones."""
     if temperature_c is None or temperature_c >= maximum_c:
         return False
-    return health == 2 or (health == 3 and temperature_c <= 48)
+    return health == 2 or (health == 3 and temperature_c <= 45)
 
 
 def validate_local_rtsp(url: str) -> str:
