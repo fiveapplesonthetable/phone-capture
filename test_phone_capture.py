@@ -75,7 +75,10 @@ class ArchiveTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             scrcpy_tunnel_host("localabstract:adb")
         self.assertTrue(scrcpy_start_allowed(2, 44.9, 45.0))
-        self.assertFalse(scrcpy_start_allowed(3, 40.0, 45.0))
+        self.assertTrue(scrcpy_start_allowed(3, 44.9, 45.0))
+        self.assertFalse(scrcpy_start_allowed(3, 48.1, 50.0))
+        self.assertFalse(scrcpy_start_allowed(3, 48.0, 48.0))
+        self.assertTrue(scrcpy_start_allowed(3, 40.0, 45.0))
         self.assertFalse(scrcpy_start_allowed(2, 45.0, 45.0))
         self.assertEqual(validate_local_rtsp("rtsp://127.0.0.1:18554/pixel-4"),
                          "rtsp://127.0.0.1:18554/pixel-4")

@@ -77,7 +77,9 @@ def scrcpy_tunnel_host(socket: str) -> str:
 def scrcpy_start_allowed(health: int | None, temperature_c: float | None,
                          maximum_c: float) -> bool:
     """Keep experimental continuous transport off warm or unhealthy phones."""
-    return health == 2 and temperature_c is not None and temperature_c < maximum_c
+    if temperature_c is None or temperature_c >= maximum_c:
+        return False
+    return health == 2 or (health == 3 and temperature_c <= 48)
 
 
 def validate_local_rtsp(url: str) -> str:
