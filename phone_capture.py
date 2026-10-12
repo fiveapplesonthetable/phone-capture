@@ -600,6 +600,16 @@ class PhoneWorker:
                 self.stop_session(sid)
                 self.session_id = None
                 return
+            # Screenrecord is a temporary bridge fallback while the phone is
+            # too warm to start scrcpy. Recheck at each sealed clip boundary so
+            # the live publisher comes back without waiting for session rotation.
+            if (self.device_id in self.config.scrcpy_bridge_device
+                    and not self.bridge_disabled):
+                reading = self.battery()
+                if scrcpy_start_allowed(reading["battery_health"], reading["temperature_c"],
+                                        self.config.scrcpy_max_start_c):
+                    LOG.info("%s cooled; returning from MP4 fallback to live scrcpy", self.device_id)
+                    return
             if time.monotonic() - self.session_started >= self.config.session_seconds:
                 self.stop_session(sid)
                 self.session_id = None

@@ -104,6 +104,30 @@ class ArchiveTests(unittest.TestCase):
         server.join(timeout=2)
         self.assertFalse(rtsp_path_available(url))
 
+    def test_screenrecord_fallback_resumes_bridge_at_clip_boundary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            worker = object.__new__(PhoneWorker)
+            worker.device_id = "pixel-4-xl"
+            worker.root = Path(temp)
+            worker.stop = threading.Event()
+            worker.session_id = "a" * 32
+            worker.session_started = time.monotonic()
+            worker.bridge_disabled = False
+            worker.config = SimpleNamespace(scrcpy_bridge_device={"pixel-4-xl"},
+                                            scrcpy_max_start_c=49.0,
+                                            session_seconds=3600)
+            worker.check_thermal = lambda: False
+            worker.battery = lambda: {"battery_health": 2, "temperature_c": 48.2}
+            calls = []
+            worker.adb = lambda *args, **_kwargs: (calls.append(args) or
+                                                   SimpleNamespace(returncode=0, stderr=""))
+
+            worker.run_screenrecord(worker.session_id)
+
+            self.assertEqual(worker.session_id, "a" * 32)
+            self.assertEqual(len(calls), 1)  # Archive directory created; no clip started.
+            self.assertEqual(calls[0][:2], ("shell", "mkdir"))
+
     def test_cuttlefish_uses_stable_viewer_id_on_local_adb(self):
         worker = object.__new__(PhoneWorker)
         worker.serial = "0.0.0.0:6520"
