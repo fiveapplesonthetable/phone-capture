@@ -90,7 +90,7 @@ def scrcpy_start_allowed(health: int | None, temperature_c: float | None,
             or temperature_c < 0 or not math.isfinite(maximum_c)
             or temperature_c >= min(maximum_c, 50)):
         return False
-    return health == 2 or (health == 3 and temperature_c <= 45)
+    return health in (1, 2, None) or (health == 3 and temperature_c <= 45)
 
 
 def scrcpy_continue_allowed(health: int | None, temperature_c: float | None,
@@ -102,7 +102,7 @@ def scrcpy_continue_allowed(health: int | None, temperature_c: float | None,
         return False
     if health == 3:
         return temperature_c <= 48
-    return health == 2 and temperature_c < maximum_c
+    return health in (1, 2, None) and temperature_c < maximum_c
 
 
 def validate_local_rtsp(url: str) -> str:

@@ -40,6 +40,18 @@ class ArchiveTests(unittest.TestCase):
         self.assertFalse(scrcpy_continue_allowed(3, 44, 44))
         self.assertFalse(scrcpy_continue_allowed(3, 47, 44))
 
+    def test_unknown_health_uses_valid_temperature_for_scrcpy(self):
+        for health in (1, None):
+            with self.subTest(health=health):
+                self.assertTrue(scrcpy_start_allowed(health, 44, 45))
+                self.assertTrue(scrcpy_continue_allowed(health, 44, 48))
+                self.assertFalse(scrcpy_start_allowed(health, None, 45))
+                self.assertFalse(scrcpy_continue_allowed(health, None, 48))
+        for health in (4, 5, 6, 7):
+            with self.subTest(blocked_health=health):
+                self.assertFalse(scrcpy_start_allowed(health, 35, 45))
+                self.assertFalse(scrcpy_continue_allowed(health, 35, 48))
+
     def test_worker_reports_reason_and_clears_it_on_recovery(self):
         worker = object.__new__(PhoneWorker)
         worker.device_id = "pixel-4"
