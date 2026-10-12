@@ -48,8 +48,11 @@ def is_archive_path(path: str) -> bool:
 
 
 def thermal_pause_reason(health: int | None, temperature_c: float | None,
-                         was_paused: bool) -> str | None:
+                         was_paused: bool,
+                         thermal_status: int | None = None) -> str | None:
     """Explain a capture hold without calling absent telemetry overheating."""
+    if thermal_status is not None and thermal_status >= 4:
+        return "hot"
     if health in (4, 5, 6, 7):  # Other unhealthy battery states.
         return "battery_health"
     if health not in (1, 2, 3, None):
@@ -59,6 +62,10 @@ def thermal_pause_reason(health: int | None, temperature_c: float | None,
         return "telemetry"
     if temperature_c >= 50:
         return "hot"
+    if thermal_status is not None and 0 <= thermal_status <= 3:
+        # System thermal severity is authoritative when available. Stale
+        # battery OVERHEAT does not add another hold in this case.
+        return None
     if health == 3:  # BatteryManager may retain OVERHEAT after cooling.
         resume_limit = 45 if was_paused else 48
         if temperature_c > resume_limit:
@@ -69,8 +76,10 @@ def thermal_pause_reason(health: int | None, temperature_c: float | None,
 
 
 def thermal_state(health: int | None, temperature_c: float | None,
-                  was_paused: bool) -> bool:
-    return thermal_pause_reason(health, temperature_c, was_paused) is not None
+                  was_paused: bool,
+                  thermal_status: int | None = None) -> bool:
+    return thermal_pause_reason(health, temperature_c, was_paused,
+                                thermal_status) is not None
 
 
 def scrcpy_tunnel_host(socket: str) -> str:
@@ -84,22 +93,36 @@ def scrcpy_tunnel_host(socket: str) -> str:
 
 
 def scrcpy_start_allowed(health: int | None, temperature_c: float | None,
-                         maximum_c: float) -> bool:
+                         maximum_c: float,
+                         thermal_status: int | None = None) -> bool:
     """Keep experimental continuous transport off warm or unhealthy phones."""
     if (temperature_c is None or not math.isfinite(temperature_c)
             or temperature_c < 0 or not math.isfinite(maximum_c)
             or temperature_c >= min(maximum_c, 50)):
         return False
+    if thermal_status is not None and thermal_status >= 4:
+        return False
+    if health in (4, 5, 6, 7) or health not in (1, 2, 3, None):
+        return False
+    if thermal_status is not None and 0 <= thermal_status <= 3:
+        return True
     return health in (1, 2, None) or (health == 3 and temperature_c <= 45)
 
 
 def scrcpy_continue_allowed(health: int | None, temperature_c: float | None,
-                            maximum_c: float) -> bool:
+                            maximum_c: float,
+                            thermal_status: int | None = None) -> bool:
     """Keep a running scrcpy stream until its health-specific warm cutoff."""
     if (temperature_c is None or not math.isfinite(temperature_c)
             or temperature_c < 0 or not math.isfinite(maximum_c)
             or temperature_c >= min(maximum_c, 50)):
         return False
+    if thermal_status is not None and thermal_status >= 4:
+        return False
+    if health in (4, 5, 6, 7) or health not in (1, 2, 3, None):
+        return False
+    if thermal_status is not None and 0 <= thermal_status <= 3:
+        return True
     if health == 3:
         return temperature_c <= 48
     return health in (1, 2, None) and temperature_c < maximum_c
@@ -270,14 +293,23 @@ class PhoneWorker:
                 match = re.search(rf"^\s*{field}:\s*(\d+)", result.stdout, re.MULTILINE)
                 if match:
                     values[field] = int(match.group(1))
+        thermal = self.adb("shell", "dumpsys", "thermalservice", timeout=10)
+        thermal_status = None
+        if thermal.returncode == 0:
+            match = re.search(r"^\s*Thermal Status:\s*([0-6])\s*$",
+                              thermal.stdout, re.MULTILINE)
+            if match:
+                thermal_status = int(match.group(1))
         return {"battery_percent": values.get("level"),
                 "temperature_c": values["temperature"] / 10 if "temperature" in values else None,
-                "battery_health": values.get("health")}
+                "battery_health": values.get("health"),
+                "thermal_status": thermal_status}
 
     def check_thermal(self) -> bool:
         reading = self.battery()
         self.pause_reason = thermal_pause_reason(
-            reading["battery_health"], reading["temperature_c"], self.paused_hot)
+            reading["battery_health"], reading["temperature_c"], self.paused_hot,
+            reading.get("thermal_status"))
         now_paused = self.pause_reason is not None
         if now_paused != self.paused_hot:
             LOG.warning("%s thermal capture state: %s (battery %s)", self.device_id,
@@ -337,7 +369,8 @@ class PhoneWorker:
                     and not self.bridge_disabled):
                 reading = self.battery()
                 if scrcpy_start_allowed(reading["battery_health"], reading["temperature_c"],
-                                        self.config.scrcpy_max_start_c):
+                                        self.config.scrcpy_max_start_c,
+                                        reading.get("thermal_status")):
                     self.run_scrcpy_bridge(sid)
                     continue
                 LOG.info("scrcpy bridge waiting for cooler %s battery (%s); using MP4 fallback",
@@ -346,7 +379,8 @@ class PhoneWorker:
             if use_scrcpy:
                 reading = self.battery()
                 if not scrcpy_start_allowed(reading["battery_health"], reading["temperature_c"],
-                                            self.config.scrcpy_max_start_c):
+                                            self.config.scrcpy_max_start_c,
+                                            reading.get("thermal_status")):
                     LOG.info("scrcpy waiting for cooler %s battery (%s); using MP4 fallback",
                              self.device_id, reading)
                     use_scrcpy = False
@@ -395,7 +429,8 @@ class PhoneWorker:
                                 reading = self.battery()
                                 if not scrcpy_continue_allowed(
                                         reading["battery_health"], reading["temperature_c"],
-                                        min(50.0, self.config.scrcpy_max_start_c + 3.0)):
+                                        min(50.0, self.config.scrcpy_max_start_c + 3.0),
+                                        reading.get("thermal_status")):
                                     LOG.warning("scrcpy reached warm cutoff on %s (%s)",
                                                 self.device_id, reading)
                                     break
@@ -545,7 +580,8 @@ class PhoneWorker:
                         reading = self.battery()
                         if not scrcpy_continue_allowed(
                                 reading["battery_health"], reading["temperature_c"],
-                                min(50.0, self.config.scrcpy_max_start_c + 3.0)):
+                                min(50.0, self.config.scrcpy_max_start_c + 3.0),
+                                reading.get("thermal_status")):
                             LOG.warning("scrcpy bridge reached warm cutoff on %s (%s)",
                                         self.device_id, reading)
                             break
@@ -607,7 +643,8 @@ class PhoneWorker:
                     and not self.bridge_disabled):
                 reading = self.battery()
                 if scrcpy_start_allowed(reading["battery_health"], reading["temperature_c"],
-                                        self.config.scrcpy_max_start_c):
+                                        self.config.scrcpy_max_start_c,
+                                        reading.get("thermal_status")):
                     LOG.info("%s cooled; returning from MP4 fallback to live scrcpy", self.device_id)
                     return
             if time.monotonic() - self.session_started >= self.config.session_seconds:
@@ -729,6 +766,7 @@ class PhoneWorker:
                                      "battery_percent": battery_fields.get("battery_percent"),
                                      "temperature_c": battery_fields.get("temperature_c"),
                                      "battery_health": battery_fields.get("battery_health"),
+                                     "thermal_status": battery_fields.get("thermal_status"),
                                      "capture_pause_reason": self.pause_reason,
                                      "capture_state": "paused_hot" if self.paused_hot else "live"}).encode())
         except (OSError, ValueError, urllib.error.URLError) as exc:

@@ -52,6 +52,43 @@ class ArchiveTests(unittest.TestCase):
                 self.assertFalse(scrcpy_start_allowed(health, 35, 45))
                 self.assertFalse(scrcpy_continue_allowed(health, 35, 48))
 
+    def test_system_thermal_status_overrides_stale_battery_overheat(self):
+        self.assertIsNone(thermal_pause_reason(3, 48.6, True, 3))
+        self.assertFalse(thermal_state(3, 48.6, True, 3))
+        self.assertTrue(scrcpy_start_allowed(3, 48.6, 49, 3))
+        self.assertTrue(scrcpy_continue_allowed(3, 48.6, 49, 3))
+
+    def test_critical_system_thermal_status_pauses_even_when_battery_is_cool(self):
+        self.assertEqual(thermal_pause_reason(2, 40, False, 4), "hot")
+        self.assertTrue(thermal_state(2, 40, False, 4))
+        self.assertFalse(scrcpy_start_allowed(2, 40, 45, 4))
+        self.assertFalse(scrcpy_continue_allowed(2, 40, 48, 4))
+
+    def test_missing_system_thermal_status_uses_battery_hysteresis_fallback(self):
+        self.assertEqual(thermal_pause_reason(3, 48.6, True, None), "cooling")
+        self.assertFalse(scrcpy_start_allowed(3, 46, 49, None))
+        self.assertTrue(scrcpy_start_allowed(3, 44, 49, None))
+        self.assertFalse(scrcpy_start_allowed(3, None, 49, None))
+
+    def test_battery_reads_thermalservice_status(self):
+        worker = object.__new__(PhoneWorker)
+        def fake_adb(*args, **_kwargs):
+            if args[-1] == "battery":
+                return SimpleNamespace(returncode=0,
+                                       stdout="level: 80\ntemperature: 486\nhealth: 3\n")
+            self.assertEqual(args[-1], "thermalservice")
+            return SimpleNamespace(returncode=0,
+                                   stdout="Thermal Status: 3\nThermal temperatures from HAL:\n")
+        worker.adb = fake_adb
+        reading = worker.battery()
+        self.assertEqual(reading["temperature_c"], 48.6)
+        self.assertEqual(reading["battery_health"], 3)
+        self.assertEqual(reading["thermal_status"], 3)
+
+        worker.adb = lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1, stdout="", stderr="unavailable")
+        self.assertIsNone(worker.battery()["thermal_status"])
+
     def test_worker_reports_reason_and_clears_it_on_recovery(self):
         worker = object.__new__(PhoneWorker)
         worker.device_id = "pixel-4"
