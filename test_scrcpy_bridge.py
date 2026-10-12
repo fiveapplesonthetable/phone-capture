@@ -9,6 +9,7 @@ import time
 import unittest
 from pathlib import Path
 import shutil
+from unittest.mock import patch
 
 import av
 
@@ -43,10 +44,16 @@ class ScrcpyProtocolTests(unittest.TestCase):
             self.assertTrue(bridge._control_request({"type":"refresh_video", "phase":"connected"}))
             self.assertFalse(bridge._control_request({"type":"refresh_video", "phase":"connected"}))
             self.assertEqual(bridge.control.sent, [bytes([17]), bytes([17])])
+            bridge.sinks = {"webcodecs:1": object()}
+            bridge.last_video_refresh_at = time.monotonic() - 21
+            bridge.last_video_packet_at = time.monotonic() - 3
+            self.assertTrue(bridge._control_request({"type": "refresh_video"}))
+            self.assertEqual(len(bridge.control.sent), 3)
+            bridge.sinks.clear()
             bridge.last_video_refresh_at = time.monotonic() - 21
             bridge.last_video_packet_at = time.monotonic()
             self.assertFalse(bridge._control_request({"type":"refresh_video"}))
-            self.assertEqual(len(bridge.control.sent), 2)
+            self.assertEqual(len(bridge.control.sent), 3)
             with self.assertRaises(ValueError):
                 bridge._control_request({"type":"refresh_video", "phase":"unlimited"})
 
@@ -90,6 +97,119 @@ class ScrcpyProtocolTests(unittest.TestCase):
                 self.assertEqual(exact(reader, size), config + frame)
             bridge.sinks["webcodecs"].close()
             listener.close()
+
+    def test_two_webcodecs_readers_both_receive_the_same_keyframe(self):
+        class FakeControl:
+            def __init__(self):
+                self.sent = []
+            def sendall(self, data):
+                self.sent.append(data)
+
+        with tempfile.TemporaryDirectory() as temp:
+            bridge = ScrcpyBridge(device_id="cuttlefish", serial="TEST",
+                                  adb_server_socket=None, tunnel_host="127.0.0.1",
+                                  server_jar=Path(temp) / "server.jar",
+                                  relay_jar=Path(temp) / "relay.jar",
+                                  runtime_dir=Path(temp), webcodecs_socket=True)
+            bridge.width, bridge.height = 642, 1520
+            bridge.control = FakeControl()
+            listener = bridge._listen(bridge.webcodecs_socket_path)
+            readers = []
+            try:
+                for _ in range(2):
+                    reader = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    reader.settimeout(2)
+                    reader.connect(str(bridge.webcodecs_socket_path))
+                    readers.append(reader)
+                    bridge._accept_reader("webcodecs", listener)
+                self.assertEqual(set(bridge.sinks), {"webcodecs", "webcodecs:1"})
+                self.assertEqual(bridge.control.sent, [bytes([17]), bytes([17])])
+
+                config = b"\x00\x00\x00\x01\x67\x42"
+                frame = b"\x00\x00\x00\x01\x65\xaa"
+                expected = config + frame
+                for sink in bridge.sinks.values():
+                    self.assertTrue(sink.offer(frame, 123456, True, config))
+                for peer in readers:
+                    self.assertEqual(exact(peer, 8), b"SCV1" + struct.pack(">HH", 642, 1520))
+                    key, pts, size = struct.unpack(">BQI", exact(peer, 13))
+                    self.assertEqual((key, pts, size), (1, 123456, len(expected)))
+                    self.assertEqual(exact(peer, size), expected)
+            finally:
+                for sink in bridge.sinks.values():
+                    sink.close()
+                for reader in readers:
+                    reader.close()
+                listener.close()
+
+    def test_webcodecs_reader_cap_rejects_newcomer_without_evicting_existing(self):
+        class FakeControl:
+            def sendall(self, _data):
+                pass
+
+        with tempfile.TemporaryDirectory() as temp, \
+             patch("scrcpy_bridge.MAX_WEBCODECS_READERS", 2):
+            bridge = ScrcpyBridge(device_id="cuttlefish", serial="TEST",
+                                  adb_server_socket=None, tunnel_host="127.0.0.1",
+                                  server_jar=Path(temp) / "server.jar",
+                                  relay_jar=Path(temp) / "relay.jar",
+                                  runtime_dir=Path(temp), webcodecs_socket=True)
+            bridge.width, bridge.height = 642, 1520
+            bridge.control = FakeControl()
+            listener = bridge._listen(bridge.webcodecs_socket_path)
+            readers = []
+            newcomer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            newcomer.settimeout(2)
+            try:
+                for _ in range(2):
+                    reader = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    reader.connect(str(bridge.webcodecs_socket_path))
+                    readers.append(reader)
+                    bridge._accept_reader("webcodecs", listener)
+                original_sinks = dict(bridge.sinks)
+
+                newcomer.connect(str(bridge.webcodecs_socket_path))
+                bridge._accept_reader("webcodecs", listener)
+                self.assertEqual(bridge.sinks, original_sinks)
+                self.assertEqual(newcomer.recv(1), b"")
+            finally:
+                for sink in bridge.sinks.values():
+                    sink.close()
+                for reader in readers:
+                    reader.close()
+                newcomer.close()
+                listener.close()
+
+    def test_webcodecs_reader_slot_is_reused_after_peer_disconnect(self):
+        class FakeControl:
+            def sendall(self, _data):
+                pass
+
+        with tempfile.TemporaryDirectory() as temp:
+            bridge = ScrcpyBridge(device_id="cuttlefish", serial="TEST",
+                                  adb_server_socket=None, tunnel_host="127.0.0.1",
+                                  server_jar=Path(temp) / "server.jar",
+                                  relay_jar=Path(temp) / "relay.jar",
+                                  runtime_dir=Path(temp), webcodecs_socket=True)
+            bridge.width, bridge.height = 642, 1520
+            bridge.control = FakeControl()
+            listener = bridge._listen(bridge.webcodecs_socket_path)
+            stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                stale.connect(str(bridge.webcodecs_socket_path))
+                bridge._accept_reader("webcodecs", listener)
+                stale.close()
+                replacement.connect(str(bridge.webcodecs_socket_path))
+                bridge._accept_reader("webcodecs", listener)
+                self.assertEqual(list(bridge.sinks), ["webcodecs"])
+                self.assertFalse(bridge.sinks["webcodecs"].closed)
+            finally:
+                for sink in bridge.sinks.values():
+                    sink.close()
+                stale.close()
+                replacement.close()
+                listener.close()
 
     def test_short_keyframe_interval_is_bounded_for_live_join(self):
         with tempfile.TemporaryDirectory() as temp:

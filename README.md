@@ -48,9 +48,10 @@ The side path publishes `pixel-4-xl-direct` (or the corresponding opted-in devic
 `--scrcpy-webcodecs-device <device-id>` adds a separate, mode-0600
 `<device-id>.webcodecs.sock` reader to the same scrcpy encoder. It is off by
 default and works for any configured bridge device. The archive and both RTSP
-publishers keep their existing sockets. The new socket has one reconnectable
-reader and a bounded queue; a slow reader is disconnected without blocking
-recording or the live publishers. A reader connection requests a fresh keyframe
+publishers keep their existing sockets. The new socket accepts up to eight
+concurrent readers, each with a bounded queue; a slow reader is disconnected
+without blocking recording or the live publishers. New readers are rejected
+when all eight slots are active. A reader connection requests a fresh keyframe
 so a static screen can start decoding.
 
 The binary stream starts with `SCV1` and big-endian width/height (`uint16`
