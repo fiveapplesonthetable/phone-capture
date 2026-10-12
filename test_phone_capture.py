@@ -1,4 +1,5 @@
 import argparse
+import json
 import shutil
 import socket
 import subprocess
@@ -13,10 +14,43 @@ from phone_capture import (PhoneWorker, is_archive_path, scrcpy_bridge_command,
                            scrcpy_live_ffmpeg_command, rtsp_path_available,
                            scrcpy_continue_allowed, scrcpy_start_allowed,
                            scrcpy_tunnel_host, stop_workers,
-                           thermal_state, validate_local_rtsp)
+                           thermal_pause_reason, thermal_state, validate_local_rtsp)
 
 
 class ArchiveTests(unittest.TestCase):
+    def test_pause_reasons_do_not_claim_unknown_or_cold_readings_are_hot(self):
+        self.assertEqual(thermal_pause_reason(7, 20, False), "battery_health")
+        self.assertEqual(thermal_pause_reason(2, None, False), "telemetry")
+        self.assertEqual(thermal_pause_reason(3, 47, True), "cooling")
+        self.assertEqual(thermal_pause_reason(3, 49, False), "hot")
+        self.assertIsNone(thermal_pause_reason(3, 35, True))
+        self.assertIsNone(thermal_pause_reason(2, 44, False))
+
+    def test_bad_temperature_does_not_bypass_guard(self):
+        for temperature in (None, float("nan"), float("inf"), -1):
+            with self.subTest(temperature=temperature):
+                self.assertTrue(thermal_state(2, temperature, False))
+                self.assertFalse(scrcpy_start_allowed(2, temperature, 49))
+                self.assertFalse(scrcpy_continue_allowed(3, temperature, 49))
+
+    def test_continue_honors_configured_cutoff_with_overheat_flag(self):
+        self.assertTrue(scrcpy_continue_allowed(3, 43.9, 44))
+        self.assertFalse(scrcpy_continue_allowed(3, 44, 44))
+        self.assertFalse(scrcpy_continue_allowed(3, 47, 44))
+
+    def test_worker_reports_reason_and_clears_it_on_recovery(self):
+        worker = object.__new__(PhoneWorker)
+        worker.device_id = "pixel-4"
+        worker.paused_hot = False
+        reports = []
+        worker.request = lambda _method, _path, body: reports.append(json.loads(body))
+        worker.battery = lambda: {"battery_health": 2, "temperature_c": None}
+        self.assertTrue(worker.check_thermal())
+        self.assertEqual(reports[-1]["capture_pause_reason"], "telemetry")
+        worker.battery = lambda: {"battery_health": 3, "temperature_c": 35}
+        self.assertFalse(worker.check_thermal())
+        self.assertIsNone(reports[-1]["capture_pause_reason"])
+
     def test_direct_side_commands_preserve_legacy_publisher(self):
         bridge = scrcpy_bridge_command("/tmp/bridge.py", "pixel-4-xl", "TEST", None,
                                        raw_live_socket=True)
@@ -242,6 +276,7 @@ class ArchiveTests(unittest.TestCase):
         worker.serial = "test-serial"
         worker.socket = None
         worker.paused_hot = False
+        worker.pause_reason = None
         worker.config = argparse.Namespace()
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
