@@ -31,6 +31,7 @@ import av
 LOG = logging.getLogger("scrcpy_bridge")
 VERSION = "4.1"
 MAX_PACKET = 8 * 1024 * 1024
+MAX_WEBCODECS_READERS = 8
 MAX_REQUEST = 4096
 VIRTUAL_POINTER_ID = 0xFFFFFFFFFFFFFFFE
 TOUCH_IDLE_TIMEOUT = 15.0
@@ -426,13 +427,25 @@ class ScrcpyBridge:
             reader, _ = listener.accept()
         except socket.timeout:
             return
-        previous = self.sinks.pop(name, None)
-        if previous:
-            previous.close()
-        if name in ("raw_live", "webcodecs"):
-            self.sinks[name] = RawVideoSink(reader, self.width, self.height)
+        sink_name = name
+        if name == "webcodecs":
+            self._cleanup_webcodecs_readers()
+            slots = ("webcodecs", *(f"webcodecs:{index}"
+                                     for index in range(1, MAX_WEBCODECS_READERS)))
+            sink_name = next((slot for slot in slots if slot not in self.sinks), None)
+            if sink_name is None:
+                reader.close()
+                LOG.warning("webcodecs reader limit reached for %s; rejecting newcomer",
+                            self.device_id)
+                return
         else:
-            self.sinks[name] = VideoSink(name, reader, self.width, self.height,
+            previous = self.sinks.pop(name, None)
+            if previous:
+                previous.close()
+        if name in ("raw_live", "webcodecs"):
+            self.sinks[sink_name] = RawVideoSink(reader, self.width, self.height)
+        else:
+            self.sinks[sink_name] = VideoSink(sink_name, reader, self.width, self.height,
                                          self.max_fps, 300 if name == "archive" else 30,
                                          64 * 1024 * 1024 if name == "archive" else 8 * 1024 * 1024)
         # A static screen may never emit another IDR; request a fresh encoder
@@ -440,7 +453,27 @@ class ScrcpyBridge:
         if self.control:
             with self.control_lock:
                 self.control.sendall(bytes([17]))  # TYPE_RESET_VIDEO
-        LOG.info("%s video consumer connected for %s", name, self.device_id)
+        LOG.info("%s video consumer connected for %s", sink_name, self.device_id)
+
+    @staticmethod
+    def _is_webcodecs_sink(name: str) -> bool:
+        return name == "webcodecs" or name.startswith("webcodecs:")
+
+    def _cleanup_webcodecs_readers(self) -> None:
+        """Drop disconnected browser relays before assigning a reader slot."""
+        for name, sink in tuple(self.sinks.items()):
+            if not self._is_webcodecs_sink(name):
+                continue
+            try:
+                peer = sink.reader.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+            except BlockingIOError:
+                continue
+            except OSError:
+                peer = b""
+            if peer == b"":
+                self.sinks.pop(name, None)
+                sink.close()
+                LOG.info("stale webcodecs reader removed for %s", self.device_id)
 
     def _video_loop(self) -> None:
         assert self.video and self.video_listener and self.live_listener
@@ -558,7 +591,8 @@ class ScrcpyBridge:
                             now - self.last_video_refresh_at >= .5)
                 initial = (now - self.last_video_packet_at >= 2 and
                            now - self.last_video_refresh_at >= 20)
-                has_live_sink = any(name in self.sinks for name in ("live", "raw_live", "webcodecs"))
+                has_live_sink = any(name in self.sinks for name in ("live", "raw_live")) or any(
+                    self._is_webcodecs_sink(name) for name in self.sinks)
                 if has_live_sink and (followup or initial):
                     self.control.sendall(bytes([17]))  # TYPE_RESET_VIDEO
                     self.last_video_refresh_at = now
