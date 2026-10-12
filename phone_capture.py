@@ -791,6 +791,11 @@ class PhoneWorker:
             # scan from the authoritative phone archive when the viewer is up.
             for marker in sorted(directory.glob("*.mirrored")):
                 clip = marker.with_suffix(".mp4")
+                # A 422 quarantine is definitive for this payload. Keep its
+                # mirror marker for provenance, but do not pull the same bad
+                # phone archive on every scan.
+                if clip.with_suffix(".rejected").exists():
+                    continue
                 if clip.exists():
                     continue
                 try:

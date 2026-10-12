@@ -5,6 +5,8 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
+import urllib.error
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -330,6 +332,46 @@ class ArchiveTests(unittest.TestCase):
             worker.upload_one = lambda sid, clip: seen.append((sid, clip.name)) or True
             worker.upload_pending()
             self.assertEqual(seen, [("abc123", "1791044403.mp4")])
+
+    def test_rejected_clip_is_not_recovered_from_phone_again(self):
+        with tempfile.TemporaryDirectory() as temp:
+            worker = object.__new__(PhoneWorker)
+            worker.root = Path(temp)
+            worker.device_id = "pixel-4"
+            worker.session_id = None
+            worker.mux_process = None
+            worker.retry_after = {}
+            worker.config = SimpleNamespace(segment_seconds=5)
+            folder = worker.root / "abc123"
+            folder.mkdir()
+            marker = folder / "1791044403.mirrored"
+            remote = "/sdcard/Movies/PhoneCapture/abc123/1791044403.mp4"
+            marker.write_text(remote)
+            adb_calls = []
+
+            def fake_adb(*args, **_kwargs):
+                adb_calls.append(args)
+                self.assertEqual(args[:2], ("pull", remote))
+                Path(args[2]).write_bytes(b"invalid video")
+                return SimpleNamespace(returncode=0, stderr="")
+
+            def fake_request(_method, path, *_args, **_kwargs):
+                if "/segments?" in path:
+                    raise urllib.error.HTTPError(path, 422, "invalid clip", {}, None)
+                return {}
+
+            worker.adb = fake_adb
+            worker.request = fake_request
+            worker.upload_pending()
+
+            rejected = folder / "1791044403.rejected"
+            self.assertTrue(rejected.exists())
+            self.assertTrue(marker.exists())
+            self.assertEqual(len(adb_calls), 1)
+            worker.upload_pending()
+            self.assertEqual(len(adb_calls), 1)
+            self.assertTrue(rejected.exists())
+            self.assertTrue(marker.exists())
 
     def test_remote_adb_bridge_clip_is_mirrored_before_viewer_upload(self):
         with tempfile.TemporaryDirectory() as temp:
