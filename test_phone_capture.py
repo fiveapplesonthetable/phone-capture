@@ -1,9 +1,12 @@
 import argparse
+import json
 import shutil
 import socket
 import subprocess
 import tempfile
 import threading
+import time
+import urllib.error
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,10 +16,55 @@ from phone_capture import (PhoneWorker, is_archive_path, scrcpy_bridge_command,
                            scrcpy_live_ffmpeg_command, rtsp_path_available,
                            scrcpy_continue_allowed, scrcpy_start_allowed,
                            scrcpy_tunnel_host, stop_workers,
-                           thermal_state, validate_local_rtsp)
+                           thermal_pause_reason, thermal_state, validate_local_rtsp)
 
 
 class ArchiveTests(unittest.TestCase):
+    def test_pause_reasons_do_not_claim_unknown_or_cold_readings_are_hot(self):
+        self.assertEqual(thermal_pause_reason(7, 20, False), "battery_health")
+        self.assertEqual(thermal_pause_reason(2, None, False), "telemetry")
+        self.assertEqual(thermal_pause_reason(3, 47, True), "cooling")
+        self.assertEqual(thermal_pause_reason(3, 49, False), "hot")
+        self.assertIsNone(thermal_pause_reason(3, 35, True))
+        self.assertIsNone(thermal_pause_reason(2, 44, False))
+
+    def test_bad_temperature_does_not_bypass_guard(self):
+        for temperature in (None, float("nan"), float("inf"), -1):
+            with self.subTest(temperature=temperature):
+                self.assertTrue(thermal_state(2, temperature, False))
+                self.assertFalse(scrcpy_start_allowed(2, temperature, 49))
+                self.assertFalse(scrcpy_continue_allowed(3, temperature, 49))
+
+    def test_continue_honors_configured_cutoff_with_overheat_flag(self):
+        self.assertTrue(scrcpy_continue_allowed(3, 43.9, 44))
+        self.assertFalse(scrcpy_continue_allowed(3, 44, 44))
+        self.assertFalse(scrcpy_continue_allowed(3, 47, 44))
+
+    def test_unknown_health_uses_valid_temperature_for_scrcpy(self):
+        for health in (1, None):
+            with self.subTest(health=health):
+                self.assertTrue(scrcpy_start_allowed(health, 44, 45))
+                self.assertTrue(scrcpy_continue_allowed(health, 44, 48))
+                self.assertFalse(scrcpy_start_allowed(health, None, 45))
+                self.assertFalse(scrcpy_continue_allowed(health, None, 48))
+        for health in (4, 5, 6, 7):
+            with self.subTest(blocked_health=health):
+                self.assertFalse(scrcpy_start_allowed(health, 35, 45))
+                self.assertFalse(scrcpy_continue_allowed(health, 35, 48))
+
+    def test_worker_reports_reason_and_clears_it_on_recovery(self):
+        worker = object.__new__(PhoneWorker)
+        worker.device_id = "pixel-4"
+        worker.paused_hot = False
+        reports = []
+        worker.request = lambda _method, _path, body: reports.append(json.loads(body))
+        worker.battery = lambda: {"battery_health": 2, "temperature_c": None}
+        self.assertTrue(worker.check_thermal())
+        self.assertEqual(reports[-1]["capture_pause_reason"], "telemetry")
+        worker.battery = lambda: {"battery_health": 3, "temperature_c": 35}
+        self.assertFalse(worker.check_thermal())
+        self.assertIsNone(reports[-1]["capture_pause_reason"])
+
     def test_direct_side_commands_preserve_legacy_publisher(self):
         bridge = scrcpy_bridge_command("/tmp/bridge.py", "pixel-4-xl", "TEST", None,
                                        raw_live_socket=True)
@@ -55,6 +103,30 @@ class ArchiveTests(unittest.TestCase):
         self.assertFalse(rtsp_path_available(url))
         server.join(timeout=2)
         self.assertFalse(rtsp_path_available(url))
+
+    def test_screenrecord_fallback_resumes_bridge_at_clip_boundary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            worker = object.__new__(PhoneWorker)
+            worker.device_id = "pixel-4-xl"
+            worker.root = Path(temp)
+            worker.stop = threading.Event()
+            worker.session_id = "a" * 32
+            worker.session_started = time.monotonic()
+            worker.bridge_disabled = False
+            worker.config = SimpleNamespace(scrcpy_bridge_device={"pixel-4-xl"},
+                                            scrcpy_max_start_c=49.0,
+                                            session_seconds=3600)
+            worker.check_thermal = lambda: False
+            worker.battery = lambda: {"battery_health": 2, "temperature_c": 48.2}
+            calls = []
+            worker.adb = lambda *args, **_kwargs: (calls.append(args) or
+                                                   SimpleNamespace(returncode=0, stderr=""))
+
+            worker.run_screenrecord(worker.session_id)
+
+            self.assertEqual(worker.session_id, "a" * 32)
+            self.assertEqual(len(calls), 1)  # Archive directory created; no clip started.
+            self.assertEqual(calls[0][:2], ("shell", "mkdir"))
 
     def test_cuttlefish_uses_stable_viewer_id_on_local_adb(self):
         worker = object.__new__(PhoneWorker)
@@ -242,6 +314,7 @@ class ArchiveTests(unittest.TestCase):
         worker.serial = "test-serial"
         worker.socket = None
         worker.paused_hot = False
+        worker.pause_reason = None
         worker.config = argparse.Namespace()
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -295,6 +368,46 @@ class ArchiveTests(unittest.TestCase):
             worker.upload_one = lambda sid, clip: seen.append((sid, clip.name)) or True
             worker.upload_pending()
             self.assertEqual(seen, [("abc123", "1791044403.mp4")])
+
+    def test_rejected_clip_is_not_recovered_from_phone_again(self):
+        with tempfile.TemporaryDirectory() as temp:
+            worker = object.__new__(PhoneWorker)
+            worker.root = Path(temp)
+            worker.device_id = "pixel-4"
+            worker.session_id = None
+            worker.mux_process = None
+            worker.retry_after = {}
+            worker.config = SimpleNamespace(segment_seconds=5)
+            folder = worker.root / "abc123"
+            folder.mkdir()
+            marker = folder / "1791044403.mirrored"
+            remote = "/sdcard/Movies/PhoneCapture/abc123/1791044403.mp4"
+            marker.write_text(remote)
+            adb_calls = []
+
+            def fake_adb(*args, **_kwargs):
+                adb_calls.append(args)
+                self.assertEqual(args[:2], ("pull", remote))
+                Path(args[2]).write_bytes(b"invalid video")
+                return SimpleNamespace(returncode=0, stderr="")
+
+            def fake_request(_method, path, *_args, **_kwargs):
+                if "/segments?" in path:
+                    raise urllib.error.HTTPError(path, 422, "invalid clip", {}, None)
+                return {}
+
+            worker.adb = fake_adb
+            worker.request = fake_request
+            worker.upload_pending()
+
+            rejected = folder / "1791044403.rejected"
+            self.assertTrue(rejected.exists())
+            self.assertTrue(marker.exists())
+            self.assertEqual(len(adb_calls), 1)
+            worker.upload_pending()
+            self.assertEqual(len(adb_calls), 1)
+            self.assertTrue(rejected.exists())
+            self.assertTrue(marker.exists())
 
     def test_remote_adb_bridge_clip_is_mirrored_before_viewer_upload(self):
         with tempfile.TemporaryDirectory() as temp:

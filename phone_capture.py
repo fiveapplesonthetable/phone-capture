@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import re
 import select
@@ -46,23 +47,30 @@ def is_archive_path(path: str) -> bool:
             and bool(VALID_FILE.fullmatch(parts[1])))
 
 
-def thermal_state(health: int | None, temperature_c: float | None,
-                  was_paused: bool) -> bool:
-    """Pause for hot batteries; use 48/45°C hysteresis for stale OVERHEAT."""
+def thermal_pause_reason(health: int | None, temperature_c: float | None,
+                         was_paused: bool) -> str | None:
+    """Explain a capture hold without calling absent telemetry overheating."""
     if health in (4, 5, 6, 7):  # Other unhealthy battery states.
-        return True
+        return "battery_health"
     if health not in (1, 2, 3, None):
-        return True
-    if temperature_c is not None and temperature_c >= 50:
-        return True
+        return "telemetry"
+    if (temperature_c is None or not math.isfinite(temperature_c)
+            or temperature_c < 0):
+        return "telemetry"
+    if temperature_c >= 50:
+        return "hot"
     if health == 3:  # BatteryManager may retain OVERHEAT after cooling.
         resume_limit = 45 if was_paused else 48
-        return temperature_c is None or temperature_c > resume_limit
-    if was_paused:
-        return temperature_c is None or temperature_c > 48
-    if health in (1, None) and temperature_c is None:
-        return True
-    return False
+        if temperature_c > resume_limit:
+            return "cooling" if was_paused else "hot"
+    elif was_paused and temperature_c > 48:
+        return "cooling"
+    return None
+
+
+def thermal_state(health: int | None, temperature_c: float | None,
+                  was_paused: bool) -> bool:
+    return thermal_pause_reason(health, temperature_c, was_paused) is not None
 
 
 def scrcpy_tunnel_host(socket: str) -> str:
@@ -78,19 +86,23 @@ def scrcpy_tunnel_host(socket: str) -> str:
 def scrcpy_start_allowed(health: int | None, temperature_c: float | None,
                          maximum_c: float) -> bool:
     """Keep experimental continuous transport off warm or unhealthy phones."""
-    if temperature_c is None or temperature_c >= maximum_c:
+    if (temperature_c is None or not math.isfinite(temperature_c)
+            or temperature_c < 0 or not math.isfinite(maximum_c)
+            or temperature_c >= min(maximum_c, 50)):
         return False
-    return health == 2 or (health == 3 and temperature_c <= 45)
+    return health in (1, 2, None) or (health == 3 and temperature_c <= 45)
 
 
 def scrcpy_continue_allowed(health: int | None, temperature_c: float | None,
                             maximum_c: float) -> bool:
     """Keep a running scrcpy stream until its health-specific warm cutoff."""
-    if temperature_c is None:
+    if (temperature_c is None or not math.isfinite(temperature_c)
+            or temperature_c < 0 or not math.isfinite(maximum_c)
+            or temperature_c >= min(maximum_c, 50)):
         return False
     if health == 3:
         return temperature_c <= 48
-    return health == 2 and temperature_c < maximum_c
+    return health in (1, 2, None) and temperature_c < maximum_c
 
 
 def validate_local_rtsp(url: str) -> str:
@@ -220,6 +232,7 @@ class PhoneWorker:
         self.session_started = 0.0
         # Fail closed until the first battery reading confirms a safe state.
         self.paused_hot = True
+        self.pause_reason = "telemetry"
         self.bridge_failures = 0
         self.bridge_disabled = False
 
@@ -263,12 +276,15 @@ class PhoneWorker:
 
     def check_thermal(self) -> bool:
         reading = self.battery()
-        now_paused = thermal_state(reading["battery_health"], reading["temperature_c"], self.paused_hot)
+        self.pause_reason = thermal_pause_reason(
+            reading["battery_health"], reading["temperature_c"], self.paused_hot)
+        now_paused = self.pause_reason is not None
         if now_paused != self.paused_hot:
             LOG.warning("%s thermal capture state: %s (battery %s)", self.device_id,
                         "paused_hot" if now_paused else "live", reading)
         self.paused_hot = now_paused
         reading["capture_state"] = "paused_hot" if now_paused else "live"
+        reading["capture_pause_reason"] = self.pause_reason
         try:
             self.request("POST", f"/api/phones/{self.device_id}/status", json.dumps(reading).encode())
         except (OSError, ValueError, urllib.error.URLError) as exc:
@@ -584,6 +600,16 @@ class PhoneWorker:
                 self.stop_session(sid)
                 self.session_id = None
                 return
+            # Screenrecord is a temporary bridge fallback while the phone is
+            # too warm to start scrcpy. Recheck at each sealed clip boundary so
+            # the live publisher comes back without waiting for session rotation.
+            if (self.device_id in self.config.scrcpy_bridge_device
+                    and not self.bridge_disabled):
+                reading = self.battery()
+                if scrcpy_start_allowed(reading["battery_health"], reading["temperature_c"],
+                                        self.config.scrcpy_max_start_c):
+                    LOG.info("%s cooled; returning from MP4 fallback to live scrcpy", self.device_id)
+                    return
             if time.monotonic() - self.session_started >= self.config.session_seconds:
                 self.stop_session(sid)
                 self.session_id = None
@@ -703,6 +729,7 @@ class PhoneWorker:
                                      "battery_percent": battery_fields.get("battery_percent"),
                                      "temperature_c": battery_fields.get("temperature_c"),
                                      "battery_health": battery_fields.get("battery_health"),
+                                     "capture_pause_reason": self.pause_reason,
                                      "capture_state": "paused_hot" if self.paused_hot else "live"}).encode())
         except (OSError, ValueError, urllib.error.URLError) as exc:
             LOG.debug("Could not report phone storage: %s", exc)
@@ -774,6 +801,11 @@ class PhoneWorker:
             # scan from the authoritative phone archive when the viewer is up.
             for marker in sorted(directory.glob("*.mirrored")):
                 clip = marker.with_suffix(".mp4")
+                # A 422 quarantine is definitive for this payload. Keep its
+                # mirror marker for provenance, but do not pull the same bad
+                # phone archive on every scan.
+                if clip.with_suffix(".rejected").exists():
+                    continue
                 if clip.exists():
                     continue
                 try:
